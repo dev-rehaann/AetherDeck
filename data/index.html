@@ -12,10 +12,19 @@
   h1 { font-size:18px; margin:0; letter-spacing:.5px; }
   .dot { width:10px; height:10px; border-radius:50%; background:#f04747; box-shadow:0 0 8px #f04747; transition:.2s; }
   .dot.on { background:#3fb950; box-shadow:0 0 8px #3fb950; }
-  main { padding:16px; max-width:900px; margin:0 auto; }
+  main { padding:16px; max-width:900px; margin:0 auto; display:flex; flex-direction:column; gap:16px; }
   .card { background:#111823; border:1px solid #1e2a38; border-radius:10px; padding:12px; }
-  .label { color:#6b7a8d; margin-bottom:8px; font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
-  #log { height:60vh; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:12px; white-space:pre-wrap; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; }
+  .label { color:#6b7a8d; font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
+  button { background:#1f6feb; color:#fff; border:0; border-radius:6px; padding:7px 14px; font-size:13px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid #1a2634; white-space:nowrap; }
+  th { color:#6b7a8d; font-weight:600; font-size:11px; text-transform:uppercase; }
+  td.ssid { white-space:normal; word-break:break-word; }
+  td.rssi { font-variant-numeric:tabular-nums; }
+  .mono { font-family:ui-monospace,Consolas,monospace; }
+  #log { height:30vh; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:12px; white-space:pre-wrap; }
   #log div { padding:1px 0; border-bottom:1px solid #0e1620; }
   .muted { color:#6b7a8d; }
 </style>
@@ -28,14 +37,28 @@
 </header>
 <main>
   <div class="card">
-    <div class="label">live log</div>
+    <div class="row">
+      <span class="label">wi-fi networks</span>
+      <button id="scan" disabled>Scan</button>
+    </div>
+    <table>
+      <thead><tr><th>SSID</th><th>BSSID</th><th>RSSI</th><th>Ch</th><th>Enc</th></tr></thead>
+      <tbody id="nets"><tr><td colspan="5" class="muted">no scan yet</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <div class="label" style="margin-bottom:8px">live log</div>
     <div id="log"></div>
   </div>
 </main>
 <script>
   const log = document.getElementById('log');
   const dot = document.getElementById('dot');
-  const status = document.getElementById('status');
+  const statusEl = document.getElementById('status');
+  const scanBtn = document.getElementById('scan');
+  const nets = document.getElementById('nets');
+  let sock = null;
+
   function add(line, cls){
     const d = document.createElement('div');
     if (cls) d.className = cls;
@@ -43,12 +66,30 @@
     log.appendChild(d);
     log.scrollTop = log.scrollHeight;
   }
+  function renderScan(list){
+    nets.innerHTML = '';
+    if (!list.length){ nets.innerHTML = '<tr><td colspan="5" class="muted">no networks found</td></tr>'; return; }
+    list.sort((a,b) => b.rssi - a.rssi);
+    for (const n of list){
+      const tr = document.createElement('tr');
+      const cells = [[n.ssid || '<hidden>','ssid'],[n.bssid,'mono'],[n.rssi + ' dBm','rssi'],[n.ch,''],[n.enc,'']];
+      for (const [val,cls] of cells){ const td = document.createElement('td'); if(cls) td.className = cls; td.textContent = val; tr.appendChild(td); }
+      nets.appendChild(tr);
+    }
+  }
+  scanBtn.onclick = () => { if (sock && sock.readyState === 1){ sock.send('scan'); scanBtn.disabled = true; } };
+
   function connect(){
-    const ws = new WebSocket('ws://' + location.host + '/ws');
-    ws.onopen = () => { dot.classList.add('on'); status.textContent = 'connected'; add('[ws] connected', 'muted'); };
-    ws.onmessage = e => add(e.data);
-    ws.onclose = () => { dot.classList.remove('on'); status.textContent = 'disconnected — retrying'; add('[ws] disconnected', 'muted'); setTimeout(connect, 1500); };
-    ws.onerror = () => ws.close();
+    sock = new WebSocket('ws://' + location.host + '/ws');
+    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = false; add('[ws] connected','muted'); };
+    sock.onmessage = e => {
+      let obj = null;
+      try { obj = JSON.parse(e.data); } catch(_) {}
+      if (obj && obj.type === 'scan'){ renderScan(obj.nets); scanBtn.disabled = false; }
+      else add(e.data);
+    };
+    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
+    sock.onerror = () => sock.close();
   }
   connect();
 </script>
