@@ -5,9 +5,6 @@
 #include <ArduinoJson.h>
 #include <esp_wifi.h>
 
-// Step 2: SoftAP + dashboard (Step 1) plus a Wi-Fi AP scanner. The browser
-// sends "scan" over the WebSocket; results go back as JSON for a live table.
-
 // Default AP credentials — meant to be known so you can connect (WPA2, >=8
 // chars). Made configurable in Settings (Step 8).
 static const char *AP_SSID = "AetherDeck";
@@ -21,8 +18,11 @@ static bool scanning = false;
 static volatile bool sniffStartRequested = false;
 static volatile bool sniffStopRequested = false;
 static volatile int channelRequested = 0;
+static volatile int hopRequested = -1;
 static bool sniffing = false;
-static uint8_t sniffChannel = 1;
+static bool hopping = false;
+static volatile uint8_t sniffChannel = 1;
+static unsigned long lastHop = 0;
 static unsigned long lastStaUpdate = 0;
 
 struct Device {
@@ -39,6 +39,21 @@ struct Device {
 static Device devices[64];
 static size_t deviceCount = 0;
 static portMUX_TYPE deviceMux = portMUX_INITIALIZER_UNLOCKED;
+
+struct Beacon {
+  uint8_t bssid[6];
+  char ssid[33];
+  uint8_t channel;
+  int8_t rssi;
+  bool privacy;
+  bool rsn;
+  uint32_t seen;
+};
+
+// shortcut: 48 beacons can evict quiet APs, raise the cap if captures need longer retention.
+static Beacon beacons[48];
+static size_t beaconCount = 0;
+static uint32_t packetCounts[14][3] = {};
 
 static bool parseSsid(const uint8_t *tags, size_t len, char *ssid) {
   for (size_t pos = 0; pos + 2 <= len;) {
@@ -63,12 +78,61 @@ static String macText(const uint8_t *mac) {
 }
 
 static void onPacket(void *buffer, wifi_promiscuous_pkt_type_t kind) {
-  if (kind != WIFI_PKT_MGMT && kind != WIFI_PKT_DATA) return;
   auto *packet = (wifi_promiscuous_pkt_t *)buffer;
+  uint8_t channel = packet->rx_ctrl.channel;
+  if (channel < 1 || channel > 13) channel = sniffChannel;
+  int cls = kind == WIFI_PKT_MGMT ? 0 : kind == WIFI_PKT_DATA ? 1 : kind == WIFI_PKT_CTRL ? 2 : -1;
+  if (channel >= 1 && channel <= 13 && cls >= 0) {
+    portENTER_CRITICAL(&deviceMux);
+    packetCounts[channel][cls]++;
+    portEXIT_CRITICAL(&deviceMux);
+  }
+  if (kind != WIFI_PKT_MGMT && kind != WIFI_PKT_DATA) return;
   const uint8_t *frame = packet->payload;
   size_t len = packet->rx_ctrl.sig_len;
+  // sig_len includes the four-byte FCS, which is not part of the tagged parameters.
+  if (len < 4) return;
+  len -= 4;
   if (len < 24) return;
   uint8_t subtype = frame[0] >> 4;
+  if (kind == WIFI_PKT_MGMT && subtype == 8) {
+    if (len < 36) return;
+    char name[33] = {};
+    if (!parseSsid(frame + 36, len - 36, name)) return;
+    uint8_t apChannel = channel;
+    bool rsn = false;
+    for (size_t pos = 36; pos + 2 <= len;) {
+      uint8_t id = frame[pos++];
+      uint8_t size = frame[pos++];
+      if (size > len - pos) return;
+      if (id == 3 && size >= 1 && frame[pos] >= 1 && frame[pos] <= 13) apChannel = frame[pos];
+      if (id == 48) rsn = true;
+      pos += size;
+    }
+    const uint8_t *ap = frame + 16;
+    portENTER_CRITICAL(&deviceMux);
+    size_t slot = 0;
+    while (slot < beaconCount && memcmp(beacons[slot].bssid, ap, 6)) slot++;
+    if (slot == beaconCount) {
+      if (beaconCount < 48) beaconCount++;
+      else {
+        slot = 0;
+        uint32_t now = millis();
+        for (size_t i = 1; i < beaconCount; i++)
+          if ((uint32_t)(now - beacons[i].seen) > (uint32_t)(now - beacons[slot].seen)) slot = i;
+      }
+    }
+    Beacon &b = beacons[slot];
+    memcpy(b.bssid, ap, 6);
+    memcpy(b.ssid, name, sizeof(name));
+    b.channel = apChannel;
+    b.rssi = packet->rx_ctrl.rssi;
+    b.privacy = frame[34] & 0x10;
+    b.rsn = rsn;
+    b.seen = millis();
+    portEXIT_CRITICAL(&deviceMux);
+    return;
+  }
   const uint8_t *client = nullptr;
   const uint8_t *bssid = nullptr;
   char ssid[33] = {};
@@ -121,6 +185,7 @@ static void sendSniffState(AsyncWebSocketClient *client = nullptr) {
   doc["type"] = "sniff";
   doc["on"] = sniffing;
   doc["ch"] = sniffChannel;
+  doc["hop"] = hopping;
   String out;
   serializeJson(doc, out);
   if (client) client->text(out);
@@ -146,6 +211,50 @@ static void sendDevices() {
     d["rssi"] = snapshot[i].rssi;
     d["seen"] = (now - snapshot[i].seen) / 1000;
   }
+  String out;
+  serializeJson(doc, out);
+  ws.textAll(out);
+}
+
+static void sendBeacons() {
+  Beacon snapshot[48];
+  size_t count;
+  portENTER_CRITICAL(&deviceMux);
+  count = beaconCount;
+  memcpy(snapshot, beacons, count * sizeof(Beacon));
+  portEXIT_CRITICAL(&deviceMux);
+  JsonDocument doc;
+  doc["type"] = "beacons";
+  JsonArray list = doc["aps"].to<JsonArray>();
+  uint32_t now = millis();
+  for (size_t i = 0; i < count; i++) {
+    JsonObject ap = list.add<JsonObject>();
+    ap["ssid"] = snapshot[i].ssid;
+    ap["bssid"] = macText(snapshot[i].bssid);
+    ap["ch"] = snapshot[i].channel;
+    ap["rssi"] = snapshot[i].rssi;
+    // Best-effort label: privacy and RSN bits do not fully identify authentication.
+    ap["enc"] = snapshot[i].rsn ? "WPA2" : snapshot[i].privacy ? "WPA/2" : "OPEN";
+    ap["seen"] = (now - snapshot[i].seen) / 1000;
+  }
+  String out;
+  serializeJson(doc, out);
+  ws.textAll(out);
+}
+
+static void sendPacketMonitor() {
+  uint32_t counts[3];
+  uint8_t channel = sniffChannel;
+  portENTER_CRITICAL(&deviceMux);
+  memcpy(counts, packetCounts[channel], sizeof(counts));
+  portEXIT_CRITICAL(&deviceMux);
+  JsonDocument doc;
+  doc["type"] = "pktmon";
+  doc["ch"] = channel;
+  doc["mgmt"] = counts[0];
+  doc["data"] = counts[1];
+  doc["ctrl"] = counts[2];
+  doc["total"] = counts[0] + counts[1] + counts[2];
   String out;
   serializeJson(doc, out);
   ws.textAll(out);
@@ -197,6 +306,8 @@ static void onWsEvent(AsyncWebSocket *, AsyncWebSocketClient *client,
       if (command == "scan") scanRequested = true;
       else if (command == "sniff:start") sniffStartRequested = true;
       else if (command == "sniff:stop") sniffStopRequested = true;
+      else if (command == "hop:on") hopRequested = 1;
+      else if (command == "hop:off") hopRequested = 0;
       else if (command.startsWith("chan:")) {
         String number = command.substring(5);
         int ch = number.toInt();
@@ -213,8 +324,15 @@ void setup() {
   char checked[33];
   const uint8_t wildcard[] = {0, 0};
   const uint8_t overrun[] = {0, 3, 'A'};
+  uint8_t beaconStyle[41] = {};
+  beaconStyle[36] = 0;
+  beaconStyle[37] = 3;
+  memcpy(beaconStyle + 38, "Lab", 3);
   if (!parseSsid(wildcard, sizeof(wildcard), checked) || checked[0] != '\0' ||
-      parseSsid(overrun, sizeof(overrun), checked)) {
+      parseSsid(overrun, sizeof(overrun), checked) ||
+      !parseSsid(beaconStyle + 36, sizeof(beaconStyle) - 36, checked) ||
+      strcmp(checked, "Lab") ||
+      parseSsid(beaconStyle + 36, 4, checked)) {
     Serial.println("SSID parser self-check failed");
     abort();
   }
@@ -247,7 +365,7 @@ void loop() {
     sniffStartRequested = false;
     if (sniffing) {
       esp_err_t err = esp_wifi_set_promiscuous(false);
-      if (err == ESP_OK) { sniffing = false; wsLog("sniffer stopped"); sendSniffState(); }
+      if (err == ESP_OK) { sniffing = false; hopping = false; wsLog("sniffer stopped"); sendSniffState(); }
       else { wsLog("sniffer stop failed: " + String(esp_err_to_name(err))); sendSniffState(); }
     }
   }
@@ -268,30 +386,57 @@ void loop() {
   if (channelRequested) {
     int ch = channelRequested;
     channelRequested = 0;
+    hopRequested = -1;
     if (scanning) { wsLog("channel change refused: scan in progress"); sendSniffState(); }
     else {
+      hopping = false;
       esp_err_t err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
       if (err == ESP_OK) { sniffChannel = ch; wsLog("channel " + String(ch)); sendSniffState(); }
       else { wsLog("channel change failed: " + String(esp_err_to_name(err))); sendSniffState(); }
     }
+  }
+  if (hopRequested != -1) {
+    int requested = hopRequested;
+    hopRequested = -1;
+    if (requested && !sniffing) wsLog("hop refused: start the sniffer first");
+    else {
+      hopping = requested;
+      lastHop = millis();
+      wsLog(hopping ? "channel hopping started" : "channel hopping stopped");
+    }
+    sendSniffState();
   }
   if (sniffStartRequested) {
     sniffStartRequested = false;
     if (scanning || scanRequested) { wsLog("sniffer refused: scan in progress"); sendSniffState(); }
     else if (!sniffing) {
       wifi_promiscuous_filter_t filter = {};
-      filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+      filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_CTRL;
       esp_err_t err = esp_wifi_set_channel(sniffChannel, WIFI_SECOND_CHAN_NONE);
       if (err == ESP_OK) err = esp_wifi_set_promiscuous_filter(&filter);
       if (err == ESP_OK) err = esp_wifi_set_promiscuous_rx_cb(onPacket);
+      if (err == ESP_OK) {
+        portENTER_CRITICAL(&deviceMux);
+        memset(packetCounts, 0, sizeof(packetCounts));
+        portEXIT_CRITICAL(&deviceMux);
+      }
       if (err == ESP_OK) err = esp_wifi_set_promiscuous(true);
-      if (err == ESP_OK) { sniffing = true; wsLog("sniffer started on channel " + String(sniffChannel)); sendSniffState(); }
+      if (err == ESP_OK) { sniffing = true; lastStaUpdate = millis(); wsLog("sniffer started on channel " + String(sniffChannel)); sendSniffState(); }
       else { wsLog("sniffer start failed: " + String(esp_err_to_name(err))); sendSniffState(); }
     }
+  }
+  if (sniffing && hopping && millis() - lastHop >= 250) {
+    lastHop = millis();
+    uint8_t next = sniffChannel == 13 ? 1 : sniffChannel + 1;
+    esp_err_t err = esp_wifi_set_channel(next, WIFI_SECOND_CHAN_NONE);
+    if (err == ESP_OK) { sniffChannel = next; sendSniffState(); }
+    else { hopping = false; wsLog("channel hop failed: " + String(esp_err_to_name(err))); sendSniffState(); }
   }
   if (sniffing && millis() - lastStaUpdate >= 1000) {
     lastStaUpdate = millis();
     sendDevices();
+    sendBeacons();
+    sendPacketMonitor();
   }
   if (scanning) {
     int n = WiFi.scanComplete();

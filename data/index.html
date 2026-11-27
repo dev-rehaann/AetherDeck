@@ -27,6 +27,9 @@
   #log { height:30vh; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:12px; white-space:pre-wrap; }
   #log div { padding:1px 0; border-bottom:1px solid #0e1620; }
   .muted { color:#6b7a8d; }
+  .meter { display:inline-block; width:100px; height:6px; margin:0 10px; background:#1e2a38; border-radius:4px; vertical-align:middle; }
+  .fill { display:block; height:100%; background:#1f6feb; border-radius:4px; }
+  .stats { display:flex; flex-wrap:wrap; gap:12px; }
 </style>
 </head>
 <body>
@@ -52,13 +55,26 @@
       <div>
         <label for="channel">Channel</label>
         <select id="channel" disabled></select>
+        <button id="hop" disabled>Hop on</button>
         <button id="sniff" disabled>Sniff start</button>
       </div>
     </div>
+    <div class="muted">Current channel: <span id="current-channel">1</span></div>
     <table>
       <thead><tr><th>Client MAC</th><th>Probed SSID / BSSID</th><th>RSSI</th><th>Last seen (s ago)</th></tr></thead>
       <tbody id="devices"><tr><td colspan="4" class="muted">sniffer stopped</td></tr></tbody>
     </table>
+  </div>
+  <div class="card">
+    <div class="label">Access points</div>
+    <table>
+      <thead><tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>RSSI</th><th>Enc</th><th>Last seen (s ago)</th></tr></thead>
+      <tbody id="beacons"><tr><td colspan="6" class="muted">no beacons seen</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <div class="label">Packet monitor — channel <span id="monitor-channel">1</span></div>
+    <div class="stats" id="packet-stats"></div>
   </div>
   <div class="card">
     <div class="label" style="margin-bottom:8px">live log</div>
@@ -74,9 +90,14 @@
   const sniffBtn = document.getElementById('sniff');
   const channel = document.getElementById('channel');
   const devices = document.getElementById('devices');
+  const hopBtn = document.getElementById('hop');
+  const currentChannel = document.getElementById('current-channel');
+  const beacons = document.getElementById('beacons');
+  const packetStats = document.getElementById('packet-stats');
   for (let ch = 1; ch <= 13; ch++) channel.add(new Option(ch, ch));
   let sock = null;
   let sniffing = false;
+  let hopping = false;
 
   function add(line, cls){
     const d = document.createElement('div');
@@ -111,29 +132,71 @@
       devices.appendChild(tr);
     }
   }
+  function renderBeacons(list){
+    beacons.replaceChildren();
+    const unique = [...new Map(list.map(ap => [ap.bssid, ap])).values()].sort((a,b) => b.rssi - a.rssi);
+    if (!unique.length){ beacons.innerHTML = '<tr><td colspan="6" class="muted">no beacons seen</td></tr>'; return; }
+    for (const ap of unique){
+      const tr = document.createElement('tr');
+      for (const [value,cls] of [[ap.ssid || '<hidden>','ssid'],[ap.bssid,'mono'],[ap.ch,''],[ap.rssi + ' dBm','rssi'],[ap.enc,''],[ap.seen,'']]){
+        const td = document.createElement('td');
+        if (cls) td.className = cls;
+        td.textContent = value;
+        tr.appendChild(td);
+      }
+      beacons.appendChild(tr);
+    }
+  }
+  function renderPackets(p){
+    document.getElementById('monitor-channel').textContent = p.ch;
+    packetStats.replaceChildren();
+    for (const key of ['mgmt','data','ctrl']){
+      const item = document.createElement('div');
+      const label = document.createElement('span');
+      label.textContent = key + ': ' + p[key];
+      const meter = document.createElement('span');
+      meter.className = 'meter';
+      const fill = document.createElement('span');
+      fill.className = 'fill';
+      fill.style.width = (p.total ? p[key] / p.total * 100 : 0) + '%';
+      meter.appendChild(fill);
+      item.append(label, meter);
+      packetStats.appendChild(item);
+    }
+    const total = document.createElement('span');
+    total.textContent = 'total: ' + p.total;
+    packetStats.appendChild(total);
+  }
   scanBtn.onclick = () => { if (sock && sock.readyState === 1){ sock.send('scan'); scanBtn.disabled = true; } };
   sniffBtn.onclick = () => { sock.send(sniffing ? 'sniff:stop' : 'sniff:start'); sniffBtn.disabled = true; };
+  hopBtn.onclick = () => { sock.send(hopping ? 'hop:off' : 'hop:on'); hopBtn.disabled = true; };
   channel.onchange = () => { if (sock && sock.readyState === 1) sock.send('chan:' + channel.value); };
 
   function connect(){
     sock = new WebSocket('ws://' + location.host + '/ws');
-    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = sniffing; sniffBtn.disabled = false; channel.disabled = false; add('[ws] connected','muted'); };
+    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = sniffing; sniffBtn.disabled = false; hopBtn.disabled = !sniffing; channel.disabled = false; add('[ws] connected','muted'); };
     sock.onmessage = e => {
       let obj = null;
       try { obj = JSON.parse(e.data); } catch(_) {}
       if (obj && obj.type === 'scan'){ renderScan(obj.nets); scanBtn.disabled = sniffing; sniffBtn.disabled = false; }
       else if (obj && obj.type === 'sta') renderDevices(obj.devices);
+      else if (obj && obj.type === 'beacons') renderBeacons(obj.aps);
+      else if (obj && obj.type === 'pktmon') renderPackets(obj);
       else if (obj && obj.type === 'sniff'){
         sniffing = obj.on;
+        hopping = obj.hop;
         channel.value = obj.ch;
+        currentChannel.textContent = obj.ch;
         sniffBtn.textContent = sniffing ? 'Sniff stop' : 'Sniff start';
+        hopBtn.textContent = hopping ? 'Hop off' : 'Hop on';
+        hopBtn.disabled = !sniffing;
         sniffBtn.disabled = false;
         scanBtn.disabled = sniffing;
         if (!sniffing) devices.innerHTML = '<tr><td colspan="4" class="muted">sniffer stopped</td></tr>';
       }
       else add(e.data);
     };
-    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; sniffBtn.disabled = true; channel.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
+    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; sniffBtn.disabled = true; hopBtn.disabled = true; channel.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
     sock.onerror = () => sock.close();
   }
   connect();
