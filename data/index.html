@@ -77,6 +77,20 @@
     <div class="stats" id="packet-stats"></div>
   </div>
   <div class="card">
+    <div class="row">
+      <span class="label">Capture</span>
+      <button id="capture" disabled>Capture start</button>
+    </div>
+    <div>File: <span id="capture-file" class="mono muted">none</span></div>
+    <div class="stats">
+      <span>EAPOL: <span id="eapol">0</span></span>
+      <span>PMKID: <span id="pmkid">0</span></span>
+      <span>Dropped: <span id="dropped">0</span></span>
+    </div>
+    <div class="label" style="margin-top:12px">Saved captures</div>
+    <div id="captures" class="muted">none</div>
+  </div>
+  <div class="card">
     <div class="label" style="margin-bottom:8px">live log</div>
     <div id="log"></div>
   </div>
@@ -94,10 +108,14 @@
   const currentChannel = document.getElementById('current-channel');
   const beacons = document.getElementById('beacons');
   const packetStats = document.getElementById('packet-stats');
+  const capBtn = document.getElementById('capture');
+  const capFile = document.getElementById('capture-file');
+  const captures = document.getElementById('captures');
   for (let ch = 1; ch <= 13; ch++) channel.add(new Option(ch, ch));
   let sock = null;
   let sniffing = false;
   let hopping = false;
+  let capturing = false;
 
   function add(line, cls){
     const d = document.createElement('div');
@@ -167,14 +185,28 @@
     total.textContent = 'total: ' + p.total;
     packetStats.appendChild(total);
   }
+  function renderCaps(list){
+    captures.replaceChildren();
+    if (!list.length){ captures.textContent = 'none'; return; }
+    for (const file of list){
+      const row = document.createElement('div');
+      const link = document.createElement('a');
+      link.href = '/caps/' + encodeURIComponent(file.name);
+      link.textContent = 'Download';
+      link.download = file.name;
+      row.append(document.createTextNode(file.name + ' (' + file.size + ' bytes) '), link);
+      captures.appendChild(row);
+    }
+  }
   scanBtn.onclick = () => { if (sock && sock.readyState === 1){ sock.send('scan'); scanBtn.disabled = true; } };
   sniffBtn.onclick = () => { sock.send(sniffing ? 'sniff:stop' : 'sniff:start'); sniffBtn.disabled = true; };
   hopBtn.onclick = () => { sock.send(hopping ? 'hop:off' : 'hop:on'); hopBtn.disabled = true; };
   channel.onchange = () => { if (sock && sock.readyState === 1) sock.send('chan:' + channel.value); };
+  capBtn.onclick = () => { sock.send(capturing ? 'cap:stop' : 'cap:start'); capBtn.disabled = true; };
 
   function connect(){
     sock = new WebSocket('ws://' + location.host + '/ws');
-    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = sniffing; sniffBtn.disabled = false; hopBtn.disabled = !sniffing; channel.disabled = false; add('[ws] connected','muted'); };
+    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = sniffing; sniffBtn.disabled = false; hopBtn.disabled = !sniffing || capturing; channel.disabled = capturing; capBtn.disabled = false; sock.send('caps:list'); add('[ws] connected','muted'); };
     sock.onmessage = e => {
       let obj = null;
       try { obj = JSON.parse(e.data); } catch(_) {}
@@ -182,6 +214,16 @@
       else if (obj && obj.type === 'sta') renderDevices(obj.devices);
       else if (obj && obj.type === 'beacons') renderBeacons(obj.aps);
       else if (obj && obj.type === 'pktmon') renderPackets(obj);
+      else if (obj && obj.type === 'caps') renderCaps(obj.files);
+      else if (obj && obj.type === 'cap'){
+        capturing = obj.on;
+        capBtn.textContent = capturing ? 'Capture stop' : 'Capture start';
+        capBtn.disabled = false;
+        capFile.textContent = obj.file || 'none';
+        for (const key of ['eapol','pmkid','dropped']) document.getElementById(key).textContent = obj[key];
+        hopBtn.disabled = !sniffing || capturing;
+        channel.disabled = capturing;
+      }
       else if (obj && obj.type === 'sniff'){
         sniffing = obj.on;
         hopping = obj.hop;
@@ -189,14 +231,14 @@
         currentChannel.textContent = obj.ch;
         sniffBtn.textContent = sniffing ? 'Sniff stop' : 'Sniff start';
         hopBtn.textContent = hopping ? 'Hop off' : 'Hop on';
-        hopBtn.disabled = !sniffing;
+        hopBtn.disabled = !sniffing || capturing;
         sniffBtn.disabled = false;
         scanBtn.disabled = sniffing;
         if (!sniffing) devices.innerHTML = '<tr><td colspan="4" class="muted">sniffer stopped</td></tr>';
       }
       else add(e.data);
     };
-    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; sniffBtn.disabled = true; hopBtn.disabled = true; channel.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
+    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; sniffBtn.disabled = true; hopBtn.disabled = true; channel.disabled = true; capBtn.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
     sock.onerror = () => sock.close();
   }
   connect();

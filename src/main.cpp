@@ -4,6 +4,7 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <esp_wifi.h>
+#include <esp_timer.h>
 
 // Default AP credentials — meant to be known so you can connect (WPA2, >=8
 // chars). Made configurable in Settings (Step 8).
@@ -55,6 +56,71 @@ static Beacon beacons[48];
 static size_t beaconCount = 0;
 static uint32_t packetCounts[14][3] = {};
 
+static volatile bool capStartRequested = false;
+static volatile bool capStopRequested = false;
+static volatile bool capsListRequested = false;
+static bool fsReady = false;
+static volatile bool capturing = false;
+static File capFile;
+static char capName[24] = "";
+static bool capCorrupt = false;
+static uint32_t capEapol = 0, capPmkid = 0, capDropped = 0;
+static constexpr size_t CAP_FRAME_MAX = 2560;
+static constexpr size_t CAP_RING_SIZE = 8;
+// shortcut: eight 2560-byte slots drop burst traffic, increase only if lab captures show overflow.
+struct CaptureFrame { uint64_t us; uint16_t len; uint8_t bytes[CAP_FRAME_MAX]; };
+static CaptureFrame capRing[CAP_RING_SIZE];
+static CaptureFrame capPending;
+static size_t capHead = 0, capTail = 0, capCount = 0;
+static portMUX_TYPE capMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void put16(uint8_t *out, uint16_t value) {
+  out[0] = value;
+  out[1] = value >> 8;
+}
+
+static void put32(uint8_t *out, uint32_t value) {
+  for (int i = 0; i < 4; i++) out[i] = value >> (8 * i);
+}
+
+static size_t globalHeader(uint8_t *out) {
+  memset(out, 0, 24);
+  put32(out, 0xA1B2C3D4);
+  put16(out + 4, 2);
+  put16(out + 6, 4);
+  put32(out + 16, 65535);
+  put32(out + 20, 105);
+  return 24;
+}
+
+static size_t packetHeader(uint8_t *out, uint64_t us, uint32_t len) {
+  put32(out, us / 1000000);
+  put32(out + 4, us % 1000000);
+  put32(out + 8, len);
+  put32(out + 12, len);
+  return 16;
+}
+
+static uint8_t pmkidsInEapol(const uint8_t *eapol, size_t len) {
+  if (len < 99 || eapol[1] != 3) return 0;
+  size_t body = ((size_t)eapol[2] << 8) | eapol[3];
+  if (body < 95 || body > len - 4 || eapol[4] != 2) return 0;
+  uint16_t info = ((uint16_t)eapol[5] << 8) | eapol[6];
+  if (!(info & 0x0008) || !(info & 0x0080) || (info & 0x0100)) return 0;
+  size_t dataLen = ((size_t)eapol[97] << 8) | eapol[98];
+  if (dataLen > body - 95) return 0;
+  size_t end = 99 + dataLen;
+  uint8_t found = 0;
+  for (size_t pos = 99; pos + 2 <= end;) {
+    uint8_t id = eapol[pos++];
+    uint8_t size = eapol[pos++];
+    if (size > end - pos) return found;
+    if (id == 221 && size == 20 && !memcmp(eapol + pos, "\x00\x0f\xac\x04", 4)) found++;
+    pos += size;
+  }
+  return found;
+}
+
 static bool parseSsid(const uint8_t *tags, size_t len, char *ssid) {
   for (size_t pos = 0; pos + 2 <= len;) {
     uint8_t id = tags[pos++];
@@ -95,6 +161,30 @@ static void onPacket(void *buffer, wifi_promiscuous_pkt_type_t kind) {
   len -= 4;
   if (len < 24) return;
   uint8_t subtype = frame[0] >> 4;
+  if (kind == WIFI_PKT_DATA && !(frame[1] & 0x40)) {
+    size_t header = 24 + ((frame[1] & 3) == 3 ? 6 : 0);
+    if (subtype & 8) header += 2;
+    if ((subtype & 8) && (frame[1] & 0x80)) header += 4;
+    if (len >= header + 8 && !memcmp(frame + header, "\xaa\xaa\x03\x00\x00\x00\x88\x8e", 8)) {
+      const uint8_t *eapol = frame + header + 8;
+      uint8_t pmkids = pmkidsInEapol(eapol, len - header - 8);
+      portENTER_CRITICAL(&capMux);
+      if (capturing) {
+        capEapol++;
+        capPmkid += pmkids;
+        if (len > CAP_FRAME_MAX || capCount == CAP_RING_SIZE) capDropped++;
+        else {
+          CaptureFrame &entry = capRing[capTail];
+          entry.us = esp_timer_get_time();
+          entry.len = len;
+          memcpy(entry.bytes, frame, len);
+          capTail = (capTail + 1) % CAP_RING_SIZE;
+          capCount++;
+        }
+      }
+      portEXIT_CRITICAL(&capMux);
+    }
+  }
   if (kind == WIFI_PKT_MGMT && subtype == 8) {
     if (len < 36) return;
     char name[33] = {};
@@ -180,7 +270,154 @@ static void wsLog(const String &line) {
   ws.textAll(line);
 }
 
-static void sendSniffState(AsyncWebSocketClient *client = nullptr) {
+static void sendSniffState(AsyncWebSocketClient *client = nullptr);
+
+static bool validCapName(const String &name) {
+  if (!name.startsWith("cap-") || !name.endsWith(".pcap") || name.length() <= 9) return false;
+  for (size_t i = 4; i < name.length() - 5; i++) if (!isDigit(name[i])) return false;
+  return true;
+}
+
+static void sendCapState(AsyncWebSocketClient *client = nullptr) {
+  uint32_t eapol, pmkid, dropped;
+  bool on;
+  char name[sizeof(capName)];
+  portENTER_CRITICAL(&capMux);
+  eapol = capEapol;
+  pmkid = capPmkid;
+  dropped = capDropped;
+  on = capturing;
+  memcpy(name, capName, sizeof(name));
+  portEXIT_CRITICAL(&capMux);
+  JsonDocument doc;
+  doc["type"] = "cap";
+  doc["on"] = on;
+  doc["file"] = name;
+  doc["eapol"] = eapol;
+  doc["pmkid"] = pmkid;
+  doc["dropped"] = dropped;
+  String out;
+  serializeJson(doc, out);
+  if (client) client->text(out);
+  else ws.textAll(out);
+}
+
+static void sendCaps() {
+  JsonDocument doc;
+  doc["type"] = "caps";
+  JsonArray list = doc["files"].to<JsonArray>();
+  if (fsReady) {
+    File dir = LittleFS.open("/caps");
+    File file = dir ? dir.openNextFile() : File();
+    while (file) {
+      String name = String(file.name());
+      name = name.substring(name.lastIndexOf('/') + 1);
+      if (validCapName(name) && !(capturing && name == capName)) {
+        JsonObject item = list.add<JsonObject>();
+        item["name"] = name;
+        item["size"] = file.size();
+      }
+      file = dir.openNextFile();
+    }
+  }
+  String out;
+  serializeJson(doc, out);
+  ws.textAll(out);
+}
+
+static bool flushCapture() {
+  bool wrote = false;
+  while (true) {
+    portENTER_CRITICAL(&capMux);
+    if (!capCount) { portEXIT_CRITICAL(&capMux); break; }
+    memcpy(&capPending, &capRing[capHead], sizeof(CaptureFrame));
+    capHead = (capHead + 1) % CAP_RING_SIZE;
+    capCount--;
+    portEXIT_CRITICAL(&capMux);
+    size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
+    if (total < used || total - used < capPending.len + 16 + 4096) {
+      portENTER_CRITICAL(&capMux);
+      capDropped++;
+      portEXIT_CRITICAL(&capMux);
+      return false;
+    }
+    uint8_t header[16];
+    packetHeader(header, capPending.us, capPending.len);
+    if (capFile.write(header, sizeof(header)) != sizeof(header) ||
+        capFile.write(capPending.bytes, capPending.len) != capPending.len) {
+      portENTER_CRITICAL(&capMux);
+      capDropped++;
+      portEXIT_CRITICAL(&capMux);
+      capCorrupt = true;
+      return false;
+    }
+    wrote = true;
+  }
+  if (wrote) capFile.flush();
+  return true;
+}
+
+static void stopCapture(const char *reason, bool drain = true) {
+  portENTER_CRITICAL(&capMux);
+  capturing = false;
+  portEXIT_CRITICAL(&capMux);
+  if (drain && !flushCapture()) reason = "capture stopped: storage full or write failed";
+  portENTER_CRITICAL(&capMux);
+  capDropped += capCount;
+  capCount = 0;
+  capHead = capTail = 0;
+  portEXIT_CRITICAL(&capMux);
+  capFile.close();
+  if (capCorrupt) {
+    LittleFS.remove(String("/caps/") + capName);
+    portENTER_CRITICAL(&capMux);
+    capName[0] = '\0';
+    portEXIT_CRITICAL(&capMux);
+    capCorrupt = false;
+    reason = "capture stopped: file write failed";
+  }
+  wsLog(reason);
+  sendCapState();
+  sendCaps();
+}
+
+static void startCapture() {
+  if (!fsReady) { wsLog("capture refused: filesystem unavailable"); sendCapState(); return; }
+  if (!sniffing || scanning) { wsLog("capture refused: sniffer unavailable"); sendCapState(); return; }
+  size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
+  if (total < used || total - used < 16384) { wsLog("capture refused: storage nearly full"); sendCapState(); return; }
+  if (!LittleFS.exists("/caps") && !LittleFS.mkdir("/caps")) {
+    wsLog("capture refused: cannot create capture directory"); sendCapState(); return;
+  }
+  String path;
+  for (uint32_t n = 1; n <= 9999; n++) {
+    path = "/caps/cap-" + String(n) + ".pcap";
+    if (!LittleFS.exists(path)) break;
+    path = "";
+  }
+  if (!path.length()) { wsLog("capture refused: file limit reached"); sendCapState(); return; }
+  capFile = LittleFS.open(path, "w");
+  uint8_t header[24];
+  globalHeader(header);
+  if (!capFile || capFile.write(header, sizeof(header)) != sizeof(header)) {
+    capFile.close();
+    LittleFS.remove(path);
+    wsLog("capture refused: cannot write file"); sendCapState(); return;
+  }
+  hopping = false;
+  capCorrupt = false;
+  portENTER_CRITICAL(&capMux);
+  snprintf(capName, sizeof(capName), "%s", path.c_str() + 6);
+  capEapol = capPmkid = capDropped = 0;
+  capHead = capTail = capCount = 0;
+  capturing = true;
+  portEXIT_CRITICAL(&capMux);
+  wsLog("capture started: " + path);
+  sendSniffState();
+  sendCapState();
+}
+
+static void sendSniffState(AsyncWebSocketClient *client) {
   JsonDocument doc;
   doc["type"] = "sniff";
   doc["on"] = sniffing;
@@ -298,6 +535,7 @@ static void onWsEvent(AsyncWebSocket *, AsyncWebSocketClient *client,
   if (type == WS_EVT_CONNECT) {
     wsLog("client connected: #" + String(client->id()));
     sendSniffState(client);
+    sendCapState(client);
   } else if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo *)arg;
     if (info->final && info->index == 0 && info->len == len &&
@@ -308,6 +546,9 @@ static void onWsEvent(AsyncWebSocket *, AsyncWebSocketClient *client,
       else if (command == "sniff:stop") sniffStopRequested = true;
       else if (command == "hop:on") hopRequested = 1;
       else if (command == "hop:off") hopRequested = 0;
+      else if (command == "cap:start") capStartRequested = true;
+      else if (command == "cap:stop") capStopRequested = true;
+      else if (command == "caps:list") capsListRequested = true;
       else if (command.startsWith("chan:")) {
         String number = command.substring(5);
         int ch = number.toInt();
@@ -337,7 +578,31 @@ void setup() {
     abort();
   }
 
-  if (!LittleFS.begin(true)) {
+  uint8_t pcap[24], record[16];
+  const uint8_t expected[24] = {
+      0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0,
+      0, 0, 0, 0, 0, 0, 0, 0,
+      0xff, 0xff, 0, 0, 105, 0, 0, 0};
+  const uint8_t expectedRecord[16] = {1, 0, 0, 0, 1, 0, 0, 0, 42, 0, 0, 0, 42, 0, 0, 0};
+  uint8_t key[121] = {};
+  key[1] = 3;
+  key[3] = 117;
+  key[4] = 2;
+  key[6] = 0x88;
+  key[98] = 22;
+  key[99] = 221;
+  key[100] = 20;
+  memcpy(key + 101, "\x00\x0f\xac\x04", 4);
+  if (globalHeader(pcap) != sizeof(pcap) || memcmp(pcap, expected, sizeof(pcap)) ||
+      packetHeader(record, 1000001, 42) != sizeof(record) ||
+      memcmp(record, expectedRecord, sizeof(record)) ||
+      pmkidsInEapol(key, sizeof(key)) != 1 || pmkidsInEapol(key, sizeof(key) - 1)) {
+    Serial.println("capture self-check failed");
+    abort();
+  }
+
+  fsReady = LittleFS.begin(false);
+  if (!fsReady) {
     Serial.println("LittleFS mount failed — dashboard assets won't serve");
   }
 
@@ -348,6 +613,15 @@ void setup() {
 
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
+  server.on(AsyncURIMatcher::dir("/caps"), HTTP_GET, [](AsyncWebServerRequest *r) {
+    String name = r->url().substring(6);
+    String path = "/caps/" + name;
+    if (!validCapName(name) || !LittleFS.exists(path) || (capturing && name == capName)) {
+      r->send(404, "text/plain", "not found");
+      return;
+    }
+    r->send(LittleFS, path, "application/vnd.tcpdump.pcap", true);
+  });
   server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
   server.onNotFound(
       [](AsyncWebServerRequest *r) { r->send(404, "text/plain", "not found"); });
@@ -360,10 +634,17 @@ unsigned long lastBeat = 0;
 void loop() {
   ws.cleanupClients();
 
+  if (capStopRequested) {
+    capStopRequested = false;
+    if (capturing) stopCapture("capture stopped");
+    else sendCapState();
+  }
+
   if (sniffStopRequested) {
     sniffStopRequested = false;
     sniffStartRequested = false;
     if (sniffing) {
+      if (capturing) stopCapture("capture stopped");
       esp_err_t err = esp_wifi_set_promiscuous(false);
       if (err == ESP_OK) { sniffing = false; hopping = false; wsLog("sniffer stopped"); sendSniffState(); }
       else { wsLog("sniffer stop failed: " + String(esp_err_to_name(err))); sendSniffState(); }
@@ -387,7 +668,8 @@ void loop() {
     int ch = channelRequested;
     channelRequested = 0;
     hopRequested = -1;
-    if (scanning) { wsLog("channel change refused: scan in progress"); sendSniffState(); }
+    if (capturing) { wsLog("channel change refused: stop capture first"); sendSniffState(); }
+    else if (scanning) { wsLog("channel change refused: scan in progress"); sendSniffState(); }
     else {
       hopping = false;
       esp_err_t err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
@@ -398,7 +680,8 @@ void loop() {
   if (hopRequested != -1) {
     int requested = hopRequested;
     hopRequested = -1;
-    if (requested && !sniffing) wsLog("hop refused: start the sniffer first");
+    if (requested && capturing) wsLog("hop refused: stop capture first");
+    else if (requested && !sniffing) wsLog("hop refused: start the sniffer first");
     else {
       hopping = requested;
       lastHop = millis();
@@ -406,6 +689,7 @@ void loop() {
     }
     sendSniffState();
   }
+  if (capStartRequested && !sniffing && !scanning && !scanRequested) sniffStartRequested = true;
   if (sniffStartRequested) {
     sniffStartRequested = false;
     if (scanning || scanRequested) { wsLog("sniffer refused: scan in progress"); sendSniffState(); }
@@ -425,6 +709,11 @@ void loop() {
       else { wsLog("sniffer start failed: " + String(esp_err_to_name(err))); sendSniffState(); }
     }
   }
+  if (capStartRequested) {
+    capStartRequested = false;
+    if (!capturing) startCapture();
+    else sendCapState();
+  }
   if (sniffing && hopping && millis() - lastHop >= 250) {
     lastHop = millis();
     uint8_t next = sniffChannel == 13 ? 1 : sniffChannel + 1;
@@ -437,7 +726,10 @@ void loop() {
     sendDevices();
     sendBeacons();
     sendPacketMonitor();
+    if (capturing) sendCapState();
   }
+  if (capturing && !flushCapture()) stopCapture("capture stopped: storage full or write failed", false);
+  if (capsListRequested) { capsListRequested = false; sendCaps(); }
   if (scanning) {
     int n = WiFi.scanComplete();
     if (n >= 0) {
