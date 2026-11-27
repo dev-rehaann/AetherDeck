@@ -1,0 +1,24 @@
+# PlatformIO / build output
+.pio/
+.pioenvs/
+.piolibdeps/
+build/
+*.bin
+*.elf
+*.map
+*.hex
+
+# Secrets / local config — never commit
+secrets.h
+include/secrets.h
+src/secrets.h
+*.secret
+.env
+*.local
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
