@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AetherDeck</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 system-ui,-apple-system,sans-serif; background:#0b0f14; color:#cdd6e4; }
+  header { padding:14px 16px; border-bottom:1px solid #1e2a38; display:flex; align-items:center; gap:10px; }
+  h1 { font-size:18px; margin:0; letter-spacing:.5px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:#f04747; box-shadow:0 0 8px #f04747; transition:.2s; }
+  .dot.on { background:#3fb950; box-shadow:0 0 8px #3fb950; }
+  main { padding:16px; max-width:900px; margin:0 auto; }
+  .card { background:#111823; border:1px solid #1e2a38; border-radius:10px; padding:12px; }
+  .label { color:#6b7a8d; margin-bottom:8px; font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
+  #log { height:60vh; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:12px; white-space:pre-wrap; }
+  #log div { padding:1px 0; border-bottom:1px solid #0e1620; }
+  .muted { color:#6b7a8d; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>AetherDeck</h1>
+  <span class="muted" id="status">connecting…</span>
+</header>
+<main>
+  <div class="card">
+    <div class="label">live log</div>
+    <div id="log"></div>
+  </div>
+</main>
+<script>
+  const log = document.getElementById('log');
+  const dot = document.getElementById('dot');
+  const status = document.getElementById('status');
+  function add(line, cls){
+    const d = document.createElement('div');
+    if (cls) d.className = cls;
+    d.textContent = line;
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+  }
+  function connect(){
+    const ws = new WebSocket('ws://' + location.host + '/ws');
+    ws.onopen = () => { dot.classList.add('on'); status.textContent = 'connected'; add('[ws] connected', 'muted'); };
+    ws.onmessage = e => add(e.data);
+    ws.onclose = () => { dot.classList.remove('on'); status.textContent = 'disconnected — retrying'; add('[ws] disconnected', 'muted'); setTimeout(connect, 1500); };
+    ws.onerror = () => ws.close();
+  }
+  connect();
+</script>
+</body>
+</html>

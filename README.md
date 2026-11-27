@@ -13,18 +13,19 @@ AetherDeck is a Wi-Fi & BLE security toolkit for the ESP32-S3, re-architected so
 ## Build & flash (PlatformIO)
 ```
 pio run                 # build
-pio run -t upload       # flash the connected ESP32-S3
+pio run -t uploadfs     # flash the web dashboard (data/) to LittleFS
+pio run -t upload       # flash the firmware to the connected ESP32-S3
 pio device monitor      # serial monitor @ 115200
 ```
 If your board is a different S3 variant, change `board` in [`platformio.ini`](platformio.ini).
 
 ## Usage
 1. Flash the firmware and power the board.
-2. From your laptop/phone, join the board's Wi-Fi network (SSID/password set in Settings; defaults documented from Step 1 on).
+2. From your laptop/phone, join the board's Wi-Fi AP — **SSID `AetherDeck`, password `aetherdeck`** (WPA2; change it in Settings later).
 3. Open **`http://192.168.4.1`** in a browser — that's the dashboard.
 
 ## Status
-**Step 0 — scaffold.** See the full roadmap in [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md).
+**Step 1 — SoftAP + web dashboard.** Boots its own Wi-Fi AP and serves a live dashboard at `192.168.4.1` with a real-time WebSocket log. See the full roadmap in [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md).
 
 ## License
 MIT — see [`LICENSE`](LICENSE).
