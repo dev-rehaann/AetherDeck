@@ -8,6 +8,7 @@ build/
 *.map
 *.hex
 /caps/
+/portal_log.txt
 
 # Secrets / local config — never commit
 secrets.h

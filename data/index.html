@@ -30,6 +30,7 @@
   .meter { display:inline-block; width:100px; height:6px; margin:0 10px; background:#1e2a38; border-radius:4px; vertical-align:middle; }
   .fill { display:block; height:100%; background:#1f6feb; border-radius:4px; }
   .stats { display:flex; flex-wrap:wrap; gap:12px; }
+  .notice { border-color:#b45309; background:#2b2119; }
 </style>
 </head>
 <body>
@@ -39,6 +40,13 @@
   <span class="muted" id="status">connecting…</span>
 </header>
 <main>
+  <div class="card notice">
+    <div class="row">
+      <span class="label">Authorized mode — lab use only</span>
+      <button id="auth" disabled>Authorize</button>
+    </div>
+    <div class="muted">Required for the captive portal demo. Resets when the board restarts.</div>
+  </div>
   <div class="card">
     <div class="row">
       <span class="label">wi-fi networks</span>
@@ -91,6 +99,18 @@
     <div id="captures" class="muted">none</div>
   </div>
   <div class="card">
+    <div class="row">
+      <span class="label">Captive portal (redacted demo)</span>
+      <button id="portal" disabled>Portal start</button>
+    </div>
+    <div>Recorded events: <span id="event-count">0</span></div>
+    <div class="muted">While running, this dashboard is at <a href="/admin">/admin</a>. Only field lengths are recorded; entered text is never sent.</div>
+    <table>
+      <thead><tr><th>Uptime (s)</th><th>Client IP</th><th>Username length</th><th>Masked password</th></tr></thead>
+      <tbody id="events"><tr><td colspan="4" class="muted">no demo events</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card">
     <div class="label" style="margin-bottom:8px">live log</div>
     <div id="log"></div>
   </div>
@@ -111,11 +131,18 @@
   const capBtn = document.getElementById('capture');
   const capFile = document.getElementById('capture-file');
   const captures = document.getElementById('captures');
+  const authBtn = document.getElementById('auth');
+  const portalBtn = document.getElementById('portal');
+  const eventCount = document.getElementById('event-count');
+  const events = document.getElementById('events');
   for (let ch = 1; ch <= 13; ch++) channel.add(new Option(ch, ch));
   let sock = null;
   let sniffing = false;
   let hopping = false;
   let capturing = false;
+  let authorized = false;
+  let portalOn = false;
+  let lastEventCount = -1;
 
   function add(line, cls){
     const d = document.createElement('div');
@@ -198,31 +225,64 @@
       captures.appendChild(row);
     }
   }
+  function renderEvents(list){
+    events.replaceChildren();
+    if (!list.length){ events.innerHTML = '<tr><td colspan="4" class="muted">no demo events</td></tr>'; return; }
+    for (const entry of list){
+      const tr = document.createElement('tr');
+      for (const value of [entry.ts, entry.ip, entry.userlen, entry.pwmask]){
+        const td = document.createElement('td');
+        td.textContent = value;
+        tr.appendChild(td);
+      }
+      events.appendChild(tr);
+    }
+  }
   scanBtn.onclick = () => { if (sock && sock.readyState === 1){ sock.send('scan'); scanBtn.disabled = true; } };
   sniffBtn.onclick = () => { sock.send(sniffing ? 'sniff:stop' : 'sniff:start'); sniffBtn.disabled = true; };
   hopBtn.onclick = () => { sock.send(hopping ? 'hop:off' : 'hop:on'); hopBtn.disabled = true; };
   channel.onchange = () => { if (sock && sock.readyState === 1) sock.send('chan:' + channel.value); };
   capBtn.onclick = () => { sock.send(capturing ? 'cap:stop' : 'cap:start'); capBtn.disabled = true; };
+  authBtn.onclick = () => { sock.send(authorized ? 'auth:off' : 'auth:on'); authBtn.disabled = true; };
+  portalBtn.onclick = () => { sock.send(portalOn ? 'portal:stop' : 'portal:start'); portalBtn.disabled = true; };
 
   function connect(){
     sock = new WebSocket('ws://' + location.host + '/ws');
-    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = sniffing; sniffBtn.disabled = false; hopBtn.disabled = !sniffing || capturing; channel.disabled = capturing; capBtn.disabled = false; sock.send('caps:list'); add('[ws] connected','muted'); };
+    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = portalOn || sniffing; sniffBtn.disabled = false; hopBtn.disabled = portalOn || !sniffing || capturing; channel.disabled = portalOn || capturing; capBtn.disabled = portalOn; authBtn.disabled = false; sock.send('caps:list'); sock.send('events:list'); add('[ws] connected','muted'); };
     sock.onmessage = e => {
       let obj = null;
       try { obj = JSON.parse(e.data); } catch(_) {}
-      if (obj && obj.type === 'scan'){ renderScan(obj.nets); scanBtn.disabled = sniffing; sniffBtn.disabled = false; }
+      if (obj && obj.type === 'scan'){ renderScan(obj.nets); scanBtn.disabled = portalOn || sniffing; sniffBtn.disabled = false; }
       else if (obj && obj.type === 'sta') renderDevices(obj.devices);
       else if (obj && obj.type === 'beacons') renderBeacons(obj.aps);
       else if (obj && obj.type === 'pktmon') renderPackets(obj);
       else if (obj && obj.type === 'caps') renderCaps(obj.files);
+      else if (obj && obj.type === 'events') renderEvents(obj.entries);
+      else if (obj && obj.type === 'auth'){
+        authorized = obj.on;
+        authBtn.textContent = authorized ? 'Authorized mode off' : 'Authorize';
+        authBtn.disabled = false;
+        portalBtn.disabled = !authorized && !portalOn;
+      }
+      else if (obj && obj.type === 'portal'){
+        portalOn = obj.on;
+        eventCount.textContent = obj.events;
+        portalBtn.textContent = portalOn ? 'Portal stop' : 'Portal start';
+        portalBtn.disabled = !authorized && !portalOn;
+        scanBtn.disabled = portalOn || sniffing;
+        hopBtn.disabled = portalOn || !sniffing || capturing;
+        channel.disabled = portalOn || capturing;
+        capBtn.disabled = portalOn;
+        if (obj.events !== lastEventCount){ lastEventCount = obj.events; sock.send('events:list'); }
+      }
       else if (obj && obj.type === 'cap'){
         capturing = obj.on;
         capBtn.textContent = capturing ? 'Capture stop' : 'Capture start';
-        capBtn.disabled = false;
+        capBtn.disabled = portalOn;
         capFile.textContent = obj.file || 'none';
         for (const key of ['eapol','pmkid','dropped']) document.getElementById(key).textContent = obj[key];
-        hopBtn.disabled = !sniffing || capturing;
-        channel.disabled = capturing;
+        hopBtn.disabled = portalOn || !sniffing || capturing;
+        channel.disabled = portalOn || capturing;
       }
       else if (obj && obj.type === 'sniff'){
         sniffing = obj.on;
@@ -231,14 +291,14 @@
         currentChannel.textContent = obj.ch;
         sniffBtn.textContent = sniffing ? 'Sniff stop' : 'Sniff start';
         hopBtn.textContent = hopping ? 'Hop off' : 'Hop on';
-        hopBtn.disabled = !sniffing || capturing;
+        hopBtn.disabled = portalOn || !sniffing || capturing;
         sniffBtn.disabled = false;
-        scanBtn.disabled = sniffing;
+        scanBtn.disabled = portalOn || sniffing;
         if (!sniffing) devices.innerHTML = '<tr><td colspan="4" class="muted">sniffer stopped</td></tr>';
       }
       else add(e.data);
     };
-    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; sniffBtn.disabled = true; hopBtn.disabled = true; channel.disabled = true; capBtn.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
+    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; sniffBtn.disabled = true; hopBtn.disabled = true; channel.disabled = true; capBtn.disabled = true; authBtn.disabled = true; portalBtn.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
     sock.onerror = () => sock.close();
   }
   connect();

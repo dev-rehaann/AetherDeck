@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wi-Fi login demo</title>
+<style>
+  body { margin:0; min-height:100vh; display:grid; place-items:center; background:#eef2f6; color:#18212b; font:16px/1.5 system-ui,sans-serif; }
+  main { width:min(420px,calc(100% - 32px)); background:white; border-radius:12px; padding:24px; box-shadow:0 8px 32px #20304020; }
+  .notice { padding:12px; border:2px solid #b45309; background:#fff7ed; border-radius:8px; font-weight:700; }
+  h1 { margin:20px 0 4px; font-size:24px; }
+  label { display:block; margin-top:16px; font-weight:600; }
+  input { display:block; width:100%; box-sizing:border-box; margin-top:6px; padding:10px; border:1px solid #9aa8b6; border-radius:6px; font:inherit; }
+  button { margin-top:20px; padding:10px 16px; border:0; border-radius:6px; background:#1f6feb; color:white; font:inherit; cursor:pointer; }
+  small { display:block; margin-top:12px; color:#4b5b6b; }
+</style>
+</head>
+<body>
+<main>
+  <div class="notice">Lab demonstration only. Use dummy values on an authorized test network.</div>
+  <h1>Wi-Fi login</h1>
+  <p>This page demonstrates a captive portal. It records only field lengths, never the text you enter.</p>
+  <form method="post" action="/login" id="demo-form" autocomplete="off">
+    <label for="username">Demo username</label>
+    <input id="username" type="text" maxlength="128" autocomplete="off">
+    <label for="password">Demo password</label>
+    <input id="password" type="password" maxlength="128" autocomplete="off">
+    <input type="hidden" id="userlen" name="userlen" value="0">
+    <input type="hidden" id="pwlen" name="pwlen" value="0">
+    <button type="submit">Submit</button>
+  </form>
+  <small>Only the two numeric lengths are submitted. The visible fields have no submitted names.</small>
+</main>
+<script>
+  document.getElementById('demo-form').addEventListener('submit', () => {
+    const user = document.getElementById('username');
+    const pass = document.getElementById('password');
+    document.getElementById('userlen').value = Math.min(user.value.length, 128);
+    document.getElementById('pwlen').value = Math.min(pass.value.length, 128);
+    user.value = '';
+    pass.value = '';
+  });
+</script>
+</body>
+</html>

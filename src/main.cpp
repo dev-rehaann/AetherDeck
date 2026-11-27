@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <esp_wifi.h>
 #include <esp_timer.h>
+#include <DNSServer.h>
 
 // Default AP credentials — meant to be known so you can connect (WPA2, >=8
 // chars). Made configurable in Settings (Step 8).
@@ -13,6 +14,29 @@ static const char *AP_PASS = "aetherdeck";
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
+DNSServer dns;
+static volatile int authRequested = -1;
+static volatile int portalRequested = -1;
+static volatile bool eventsListRequested = false;
+static volatile bool authorized = false;
+static volatile bool portalOn = false;
+static volatile uint8_t eventCount = 0;
+static uint8_t eventReserved = 0;
+static unsigned long lastPortalUpdate = 0;
+
+struct PortalEvent { uint32_t ts; char ip[16]; uint8_t userLen, pwLen; };
+static PortalEvent eventQueue[8];
+static size_t eventHead = 0, eventTail = 0, queuedEvents = 0;
+static portMUX_TYPE eventMux = portMUX_INITIALIZER_UNLOCKED;
+
+static uint8_t cappedLength(const String &value) {
+  unsigned n = 0;
+  for (size_t i = 0; i < value.length(); i++) {
+    if (!isDigit(value[i])) return 0;
+    n = min(128u, n * 10 + (unsigned)(value[i] - '0'));
+  }
+  return n;
+}
 
 static volatile bool scanRequested = false;
 static bool scanning = false;
@@ -270,6 +294,97 @@ static void wsLog(const String &line) {
   ws.textAll(line);
 }
 
+static void sendAuthState(AsyncWebSocketClient *client = nullptr) {
+  JsonDocument doc;
+  doc["type"] = "auth";
+  doc["on"] = authorized;
+  String out;
+  serializeJson(doc, out);
+  if (client) client->text(out);
+  else ws.textAll(out);
+}
+
+static void sendPortalState(AsyncWebSocketClient *client = nullptr) {
+  JsonDocument doc;
+  doc["type"] = "portal";
+  doc["on"] = portalOn;
+  doc["events"] = eventCount;
+  String out;
+  serializeJson(doc, out);
+  if (client) client->text(out);
+  else ws.textAll(out);
+}
+
+static bool queuePortalEvent(uint8_t userLen, uint8_t pwLen, const String &ip) {
+  portENTER_CRITICAL(&eventMux);
+  if (eventReserved >= 64 || queuedEvents == 8) {
+    portEXIT_CRITICAL(&eventMux);
+    return false;
+  }
+  PortalEvent &event = eventQueue[eventTail];
+  event.ts = millis() / 1000;
+  snprintf(event.ip, sizeof(event.ip), "%s", ip.c_str());
+  event.userLen = userLen;
+  event.pwLen = pwLen;
+  eventTail = (eventTail + 1) % 8;
+  queuedEvents++;
+  eventReserved++;
+  portEXIT_CRITICAL(&eventMux);
+  return true;
+}
+
+static void flushPortalEvents() {
+  while (true) {
+    PortalEvent event;
+    portENTER_CRITICAL(&eventMux);
+    if (!queuedEvents) { portEXIT_CRITICAL(&eventMux); break; }
+    event = eventQueue[eventHead];
+    eventHead = (eventHead + 1) % 8;
+    queuedEvents--;
+    portEXIT_CRITICAL(&eventMux);
+    if (!fsReady) continue;
+    File file = LittleFS.open("/portal_log.txt", "a");
+    if (!file || file.size() >= 8192) { wsLog("demo event log full or unavailable"); continue; }
+    String line = String(event.ts) + "," + event.ip + "," + String(event.userLen) + "," + String(event.pwLen) + "\n";
+    if (file.size() + line.length() > 8192 || file.print(line) != line.length()) {
+      wsLog("demo event log write failed");
+      continue;
+    }
+    file.close();
+    portENTER_CRITICAL(&eventMux);
+    eventCount = eventCount + 1;
+    portEXIT_CRITICAL(&eventMux);
+    wsLog("redacted demo event recorded");
+    sendPortalState();
+  }
+}
+
+static void sendPortalEvents() {
+  JsonDocument doc;
+  doc["type"] = "events";
+  JsonArray entries = doc["entries"].to<JsonArray>();
+  if (fsReady) {
+    File file = LittleFS.open("/portal_log.txt", "r");
+    char line[64];
+    for (int i = 0; file && file.available() && i < 64; i++) {
+      size_t n = file.readBytesUntil('\n', line, sizeof(line) - 1);
+      line[n] = '\0';
+      unsigned long ts;
+      unsigned userLen, pwLen;
+      char ip[16];
+      if (sscanf(line, "%lu,%15[^,],%u,%u", &ts, ip, &userLen, &pwLen) != 4 || userLen > 128 || pwLen > 128) continue;
+      JsonObject entry = entries.add<JsonObject>();
+      entry["ts"] = ts;
+      entry["ip"] = ip;
+      entry["userlen"] = userLen;
+      entry["pwmask"] = String("**** (") + pwLen + ")";
+    }
+  }
+  String out;
+  serializeJson(doc, out);
+  ws.textAll(out);
+}
+
 static void sendSniffState(AsyncWebSocketClient *client = nullptr);
 
 static bool validCapName(const String &name) {
@@ -382,6 +497,7 @@ static void stopCapture(const char *reason, bool drain = true) {
 }
 
 static void startCapture() {
+  if (portalOn) { wsLog("capture refused: stop the demo portal first"); sendCapState(); return; }
   if (!fsReady) { wsLog("capture refused: filesystem unavailable"); sendCapState(); return; }
   if (!sniffing || scanning) { wsLog("capture refused: sniffer unavailable"); sendCapState(); return; }
   size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
@@ -415,6 +531,40 @@ static void startCapture() {
   wsLog("capture started: " + path);
   sendSniffState();
   sendCapState();
+}
+
+static void stopPortal() {
+  if (!portalOn) return;
+  portalOn = false;
+  dns.stop();
+  wsLog("demo portal stopped");
+  sendPortalState();
+}
+
+static void startPortal() {
+  if (!authorized) { wsLog("demo portal refused: Authorized mode is off"); sendPortalState(); return; }
+  if (!fsReady || !LittleFS.exists("/portal/index.html")) {
+    wsLog("demo portal refused: page unavailable"); sendPortalState(); return;
+  }
+  if (scanning) { wsLog("demo portal refused: scan in progress"); sendPortalState(); return; }
+  wifi_config_t ap = {};
+  esp_err_t err = esp_wifi_get_config(WIFI_IF_AP, &ap);
+  uint8_t current = 0;
+  wifi_second_chan_t secondary;
+  if (err == ESP_OK) err = esp_wifi_get_channel(&current, &secondary);
+  uint8_t pinned = ap.ap.channel ? ap.ap.channel : current;
+  if (err == ESP_OK && current != pinned) err = esp_wifi_set_channel(pinned, WIFI_SECOND_CHAN_NONE);
+  if (err != ESP_OK) { wsLog("demo portal refused: cannot pin AP channel: " + String(esp_err_to_name(err))); sendPortalState(); return; }
+  if (!dns.start(53, "*", WiFi.softAPIP())) {
+    wsLog("demo portal refused: DNS unavailable"); sendPortalState(); return;
+  }
+  if (capturing) stopCapture("capture stopped for demo portal");
+  hopping = false;
+  sniffChannel = pinned;
+  portalOn = true;
+  wsLog("demo portal started on channel " + String(sniffChannel));
+  sendSniffState();
+  sendPortalState();
 }
 
 static void sendSniffState(AsyncWebSocketClient *client) {
@@ -536,6 +686,8 @@ static void onWsEvent(AsyncWebSocket *, AsyncWebSocketClient *client,
     wsLog("client connected: #" + String(client->id()));
     sendSniffState(client);
     sendCapState(client);
+    sendAuthState(client);
+    sendPortalState(client);
   } else if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo *)arg;
     if (info->final && info->index == 0 && info->len == len &&
@@ -549,6 +701,11 @@ static void onWsEvent(AsyncWebSocket *, AsyncWebSocketClient *client,
       else if (command == "cap:start") capStartRequested = true;
       else if (command == "cap:stop") capStopRequested = true;
       else if (command == "caps:list") capsListRequested = true;
+      else if (command == "auth:on") authRequested = 1;
+      else if (command == "auth:off") authRequested = 0;
+      else if (command == "portal:start") portalRequested = 1;
+      else if (command == "portal:stop") portalRequested = 0;
+      else if (command == "events:list") eventsListRequested = true;
       else if (command.startsWith("chan:")) {
         String number = command.substring(5);
         int ch = number.toInt();
@@ -600,10 +757,18 @@ void setup() {
     Serial.println("capture self-check failed");
     abort();
   }
+  if (cappedLength("") != 0 || cappedLength("999999999999") != 128 || cappedLength("12x") != 0) {
+    Serial.println("demo input self-check failed");
+    abort();
+  }
 
   fsReady = LittleFS.begin(false);
   if (!fsReady) {
     Serial.println("LittleFS mount failed — dashboard assets won't serve");
+  } else {
+    File log = LittleFS.open("/portal_log.txt", "r");
+    while (log && log.available() && eventCount < 64) if (log.read() == '\n') eventCount = eventCount + 1;
+    eventReserved = eventCount;
   }
 
   WiFi.mode(WIFI_AP_STA);  // AP serves the dashboard; STA lets us scan
@@ -613,6 +778,26 @@ void setup() {
 
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send(LittleFS, portalOn ? "/portal/index.html" : "/index.html", "text/html");
+  });
+  server.on("/admin", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send(LittleFS, "/index.html", "text/html");
+  });
+  for (const char *url : {"/generate_204", "/gen_204", "/hotspot-detect.html", "/connecttest.txt", "/ncsi.txt"}) {
+    server.on(url, HTTP_GET, [](AsyncWebServerRequest *r) {
+      if (portalOn) r->redirect("http://192.168.4.1/");
+      else r->send(404, "text/plain", "not found");
+    });
+  }
+  server.on("/login", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (!portalOn || !authorized) { r->send(404, "text/plain", "not found"); return; }
+    uint8_t userLen = r->hasParam("userlen", true) ? cappedLength(r->getParam("userlen", true)->value()) : 0;
+    uint8_t pwLen = r->hasParam("pwlen", true) ? cappedLength(r->getParam("pwlen", true)->value()) : 0;
+    queuePortalEvent(userLen, pwLen, r->client()->remoteIP().toString());
+    r->send(200, "text/html", "<!doctype html><meta name=viewport content='width=device-width'><title>Connecting</title><h1>Connecting, please wait</h1><p>Lab demonstration only.</p>");
+  });
+  server.on("/portal_log.txt", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(404, "text/plain", "not found"); });
   server.on(AsyncURIMatcher::dir("/caps"), HTTP_GET, [](AsyncWebServerRequest *r) {
     String name = r->url().substring(6);
     String path = "/caps/" + name;
@@ -623,8 +808,12 @@ void setup() {
     r->send(LittleFS, path, "application/vnd.tcpdump.pcap", true);
   });
   server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
-  server.onNotFound(
-      [](AsyncWebServerRequest *r) { r->send(404, "text/plain", "not found"); });
+  server.onNotFound([](AsyncWebServerRequest *r) {
+    String path = r->url();
+    if (portalOn && !path.startsWith("/admin") && !path.startsWith("/ws") &&
+        !path.startsWith("/caps") && !path.startsWith("/portal/")) r->redirect("http://192.168.4.1/");
+    else r->send(404, "text/plain", "not found");
+  });
   server.begin();
   Serial.println("web server up -> http://192.168.4.1");
 }
@@ -633,6 +822,28 @@ unsigned long lastBeat = 0;
 
 void loop() {
   ws.cleanupClients();
+
+  if (authRequested != -1) {
+    int requested = authRequested;
+    authRequested = -1;
+    if (!requested) stopPortal();
+    authorized = requested;
+    wsLog(authorized ? "Authorized mode on" : "Authorized mode off");
+    sendAuthState();
+  }
+  if (portalRequested != -1) {
+    int requested = portalRequested;
+    portalRequested = -1;
+    if (requested && !portalOn) startPortal();
+    else if (!requested) stopPortal();
+    else sendPortalState();
+  }
+  flushPortalEvents();
+  if (eventsListRequested) { eventsListRequested = false; sendPortalEvents(); }
+  if (portalOn && millis() - lastPortalUpdate >= 1000) {
+    lastPortalUpdate = millis();
+    sendPortalState();
+  }
 
   if (capStopRequested) {
     capStopRequested = false;
@@ -656,7 +867,8 @@ void loop() {
   // not the async WS callback, to avoid blocking the server task.
   if (scanRequested && !scanning) {
     scanRequested = false;
-    if (sniffing) wsLog("scan refused: stop the sniffer first");
+    if (portalOn) wsLog("scan refused: stop the demo portal first");
+    else if (sniffing) wsLog("scan refused: stop the sniffer first");
     else {
       scanning = true;
       wsLog("scanning...");
@@ -668,7 +880,8 @@ void loop() {
     int ch = channelRequested;
     channelRequested = 0;
     hopRequested = -1;
-    if (capturing) { wsLog("channel change refused: stop capture first"); sendSniffState(); }
+    if (portalOn) { wsLog("channel change refused: stop the demo portal first"); sendSniffState(); }
+    else if (capturing) { wsLog("channel change refused: stop capture first"); sendSniffState(); }
     else if (scanning) { wsLog("channel change refused: scan in progress"); sendSniffState(); }
     else {
       hopping = false;
@@ -680,7 +893,8 @@ void loop() {
   if (hopRequested != -1) {
     int requested = hopRequested;
     hopRequested = -1;
-    if (requested && capturing) wsLog("hop refused: stop capture first");
+    if (requested && portalOn) wsLog("hop refused: stop the demo portal first");
+    else if (requested && capturing) wsLog("hop refused: stop capture first");
     else if (requested && !sniffing) wsLog("hop refused: start the sniffer first");
     else {
       hopping = requested;

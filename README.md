@@ -25,7 +25,7 @@ If your board is a different S3 variant, change `board` in [`platformio.ini`](pl
 3. Open **`http://192.168.4.1`** in a browser — that's the dashboard.
 
 ## Status
-**Step 5 — handshake capture.** The dashboard at `192.168.4.1` provides passive scans and monitoring, plus local EAPOL capture files that can be downloaded as PCAP. See the full roadmap in [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md).
+**Step 6 — captive portal demonstration.** The dashboard at `192.168.4.1` provides passive scans, monitoring, PCAP capture, and an Authorized mode gated lab portal that records only redacted field lengths. See the full roadmap in [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md).
 
 ## License
 MIT — see [`LICENSE`](LICENSE).
