@@ -47,6 +47,20 @@
     </table>
   </div>
   <div class="card">
+    <div class="row">
+      <span class="label">Wi-Fi sniffer</span>
+      <div>
+        <label for="channel">Channel</label>
+        <select id="channel" disabled></select>
+        <button id="sniff" disabled>Sniff start</button>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Client MAC</th><th>Probed SSID / BSSID</th><th>RSSI</th><th>Last seen (s ago)</th></tr></thead>
+      <tbody id="devices"><tr><td colspan="4" class="muted">sniffer stopped</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card">
     <div class="label" style="margin-bottom:8px">live log</div>
     <div id="log"></div>
   </div>
@@ -57,7 +71,12 @@
   const statusEl = document.getElementById('status');
   const scanBtn = document.getElementById('scan');
   const nets = document.getElementById('nets');
+  const sniffBtn = document.getElementById('sniff');
+  const channel = document.getElementById('channel');
+  const devices = document.getElementById('devices');
+  for (let ch = 1; ch <= 13; ch++) channel.add(new Option(ch, ch));
   let sock = null;
+  let sniffing = false;
 
   function add(line, cls){
     const d = document.createElement('div');
@@ -77,18 +96,44 @@
       nets.appendChild(tr);
     }
   }
+  function renderDevices(list){
+    devices.replaceChildren();
+    const unique = [...new Map(list.map(d => [d.mac, d])).values()].sort((a,b) => a.seen - b.seen);
+    if (!unique.length){ devices.innerHTML = '<tr><td colspan="4" class="muted">no clients seen</td></tr>'; return; }
+    for (const d of unique){
+      const tr = document.createElement('tr');
+      for (const [value,cls] of [[d.mac,'mono'],[d.probe ? (d.target || '<broadcast>') : d.target,'ssid'],[d.rssi + ' dBm','rssi'],[d.seen,'']]){
+        const td = document.createElement('td');
+        if (cls) td.className = cls;
+        td.textContent = value;
+        tr.appendChild(td);
+      }
+      devices.appendChild(tr);
+    }
+  }
   scanBtn.onclick = () => { if (sock && sock.readyState === 1){ sock.send('scan'); scanBtn.disabled = true; } };
+  sniffBtn.onclick = () => { sock.send(sniffing ? 'sniff:stop' : 'sniff:start'); sniffBtn.disabled = true; };
+  channel.onchange = () => { if (sock && sock.readyState === 1) sock.send('chan:' + channel.value); };
 
   function connect(){
     sock = new WebSocket('ws://' + location.host + '/ws');
-    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = false; add('[ws] connected','muted'); };
+    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = sniffing; sniffBtn.disabled = false; channel.disabled = false; add('[ws] connected','muted'); };
     sock.onmessage = e => {
       let obj = null;
       try { obj = JSON.parse(e.data); } catch(_) {}
-      if (obj && obj.type === 'scan'){ renderScan(obj.nets); scanBtn.disabled = false; }
+      if (obj && obj.type === 'scan'){ renderScan(obj.nets); scanBtn.disabled = sniffing; sniffBtn.disabled = false; }
+      else if (obj && obj.type === 'sta') renderDevices(obj.devices);
+      else if (obj && obj.type === 'sniff'){
+        sniffing = obj.on;
+        channel.value = obj.ch;
+        sniffBtn.textContent = sniffing ? 'Sniff stop' : 'Sniff start';
+        sniffBtn.disabled = false;
+        scanBtn.disabled = sniffing;
+        if (!sniffing) devices.innerHTML = '<tr><td colspan="4" class="muted">sniffer stopped</td></tr>';
+      }
       else add(e.data);
     };
-    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
+    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; sniffBtn.disabled = true; channel.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
     sock.onerror = () => sock.close();
   }
   connect();

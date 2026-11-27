@@ -25,7 +25,7 @@ If your board is a different S3 variant, change `board` in [`platformio.ini`](pl
 3. Open **`http://192.168.4.1`** in a browser — that's the dashboard.
 
 ## Status
-**Step 1 — SoftAP + web dashboard.** Boots its own Wi-Fi AP and serves a live dashboard at `192.168.4.1` with a real-time WebSocket log. See the full roadmap in [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md).
+**Step 3 — passive Wi-Fi sniffer.** The dashboard at `192.168.4.1` provides AP scans and a fixed-channel live table of probe requests and client stations. See the full roadmap in [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md).
 
 ## License
 MIT — see [`LICENSE`](LICENSE).
