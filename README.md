@@ -25,7 +25,7 @@ If your board is a different S3 variant, change `board` in [`platformio.ini`](pl
 3. Open **`http://192.168.4.1`** in a browser — that's the dashboard.
 
 ## Status
-**Step 6 — captive portal demonstration.** The dashboard at `192.168.4.1` provides passive scans, monitoring, PCAP capture, and an Authorized mode gated lab portal that records only redacted field lengths. See the full roadmap in [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md).
+**Step 7 — passive detection.** The dashboard at `192.168.4.1` provides scans, monitoring, PCAP capture, an Authorized mode gated lab portal that records only redacted field lengths, and alerts for multiple SSIDs from one BSSID, duplicate SSIDs, and deauthentication bursts. See [`docs/DETECTION.md`](docs/DETECTION.md) for detection limits and [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) for the roadmap.
 
 ## License
 MIT — see [`LICENSE`](LICENSE).

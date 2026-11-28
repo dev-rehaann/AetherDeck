@@ -31,6 +31,10 @@
   .fill { display:block; height:100%; background:#1f6feb; border-radius:4px; }
   .stats { display:flex; flex-wrap:wrap; gap:12px; }
   .notice { border-color:#b45309; background:#2b2119; }
+  #alerts { max-height:250px; overflow:auto; }
+  #alerts .karma { color:#f0b44f; }
+  #alerts .evil_twin { color:#f0b44f; }
+  #alerts .deauth { color:#f07878; }
 </style>
 </head>
 <body>
@@ -86,6 +90,14 @@
   </div>
   <div class="card">
     <div class="row">
+      <span class="label">Detect — passive indicators</span>
+      <label>KARMA threshold <select id="detect-threshold" disabled></select></label>
+    </div>
+    <div class="muted">Alerts appear while the sniffer runs. Duplicate SSIDs can be normal on roaming networks.</div>
+    <div id="alerts" role="log" aria-live="polite"><div class="muted">no alerts yet</div></div>
+  </div>
+  <div class="card">
+    <div class="row">
       <span class="label">Capture</span>
       <button id="capture" disabled>Capture start</button>
     </div>
@@ -128,6 +140,8 @@
   const currentChannel = document.getElementById('current-channel');
   const beacons = document.getElementById('beacons');
   const packetStats = document.getElementById('packet-stats');
+  const detectThreshold = document.getElementById('detect-threshold');
+  const alerts = document.getElementById('alerts');
   const capBtn = document.getElementById('capture');
   const capFile = document.getElementById('capture-file');
   const captures = document.getElementById('captures');
@@ -136,6 +150,7 @@
   const eventCount = document.getElementById('event-count');
   const events = document.getElementById('events');
   for (let ch = 1; ch <= 13; ch++) channel.add(new Option(ch, ch));
+  for (let n = 1; n <= 16; n++) detectThreshold.add(new Option(n, n));
   let sock = null;
   let sniffing = false;
   let hopping = false;
@@ -212,6 +227,14 @@
     total.textContent = 'total: ' + p.total;
     packetStats.appendChild(total);
   }
+  function renderAlert(a){
+    if (alerts.querySelector('.muted')) alerts.replaceChildren();
+    const row = document.createElement('div');
+    row.className = a.kind;
+    row.textContent = '[' + a.ts + 's] ' + a.kind.replace('_', ' ') + ': ' + a.detail;
+    alerts.prepend(row);
+    while (alerts.children.length > 100) alerts.lastElementChild.remove();
+  }
   function renderCaps(list){
     captures.replaceChildren();
     if (!list.length){ captures.textContent = 'none'; return; }
@@ -245,10 +268,11 @@
   capBtn.onclick = () => { sock.send(capturing ? 'cap:stop' : 'cap:start'); capBtn.disabled = true; };
   authBtn.onclick = () => { sock.send(authorized ? 'auth:off' : 'auth:on'); authBtn.disabled = true; };
   portalBtn.onclick = () => { sock.send(portalOn ? 'portal:stop' : 'portal:start'); portalBtn.disabled = true; };
+  detectThreshold.onchange = () => { if (sock && sock.readyState === 1) sock.send('detect:thresh:' + detectThreshold.value); };
 
   function connect(){
     sock = new WebSocket('ws://' + location.host + '/ws');
-    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = portalOn || sniffing; sniffBtn.disabled = false; hopBtn.disabled = portalOn || !sniffing || capturing; channel.disabled = portalOn || capturing; capBtn.disabled = portalOn; authBtn.disabled = false; sock.send('caps:list'); sock.send('events:list'); add('[ws] connected','muted'); };
+    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = portalOn || sniffing; sniffBtn.disabled = false; hopBtn.disabled = portalOn || !sniffing || capturing; channel.disabled = portalOn || capturing; capBtn.disabled = portalOn; authBtn.disabled = false; detectThreshold.disabled = false; sock.send('caps:list'); sock.send('events:list'); add('[ws] connected','muted'); };
     sock.onmessage = e => {
       let obj = null;
       try { obj = JSON.parse(e.data); } catch(_) {}
@@ -256,6 +280,8 @@
       else if (obj && obj.type === 'sta') renderDevices(obj.devices);
       else if (obj && obj.type === 'beacons') renderBeacons(obj.aps);
       else if (obj && obj.type === 'pktmon') renderPackets(obj);
+      else if (obj && obj.type === 'detect') detectThreshold.value = obj.thresh;
+      else if (obj && obj.type === 'alert') renderAlert(obj);
       else if (obj && obj.type === 'caps') renderCaps(obj.files);
       else if (obj && obj.type === 'events') renderEvents(obj.entries);
       else if (obj && obj.type === 'auth'){
@@ -298,7 +324,7 @@
       }
       else add(e.data);
     };
-    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; sniffBtn.disabled = true; hopBtn.disabled = true; channel.disabled = true; capBtn.disabled = true; authBtn.disabled = true; portalBtn.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
+    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; sniffBtn.disabled = true; hopBtn.disabled = true; channel.disabled = true; capBtn.disabled = true; authBtn.disabled = true; portalBtn.disabled = true; detectThreshold.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
     sock.onerror = () => sock.close();
   }
   connect();

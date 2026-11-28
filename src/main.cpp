@@ -80,6 +80,23 @@ static Beacon beacons[48];
 static size_t beaconCount = 0;
 static uint32_t packetCounts[14][3] = {};
 
+struct Advertiser {
+  uint8_t bssid[6];
+  char names[16][33];
+  uint8_t count;
+  uint32_t seen;
+};
+// shortcut: 32 BSSIDs and 16 names each bound RAM; raise these caps if crowded lab traffic needs longer tracking.
+static Advertiser advertisers[32];
+static size_t advertiserCount = 0;
+static uint8_t karmaThreshold = 3;
+static volatile int thresholdRequested = 0;
+static uint32_t deauthFrames = 0;
+static uint8_t deauthSource[6] = {}, deauthTarget[6] = {};
+struct AlertStamp { uint64_t key; uint32_t sent; };
+static AlertStamp alertStamps[64] = {};
+static size_t alertStampCount = 0;
+
 static volatile bool capStartRequested = false;
 static volatile bool capStopRequested = false;
 static volatile bool capsListRequested = false;
@@ -167,6 +184,38 @@ static String macText(const uint8_t *mac) {
   return String(out);
 }
 
+// Caller holds deviceMux when packets are live.
+static uint8_t trackAdvertiser(const uint8_t *bssid, const char *ssid) {
+  if (!ssid[0]) return 0;
+  size_t slot = 0;
+  while (slot < advertiserCount && memcmp(advertisers[slot].bssid, bssid, 6)) slot++;
+  if (slot == advertiserCount) {
+    if (advertiserCount < 32) advertiserCount++;
+    else {
+      slot = 0;
+      uint32_t now = millis();
+      for (size_t i = 1; i < advertiserCount; i++)
+        if ((uint32_t)(now - advertisers[i].seen) > (uint32_t)(now - advertisers[slot].seen)) slot = i;
+    }
+    advertisers[slot] = {};
+    memcpy(advertisers[slot].bssid, bssid, 6);
+  }
+  Advertiser &a = advertisers[slot];
+  a.seen = millis();
+  for (uint8_t i = 0; i < a.count; i++) if (!strcmp(a.names[i], ssid)) return a.count;
+  if (a.count < 16) { strncpy(a.names[a.count], ssid, 32); a.count++; }
+  return a.count;
+}
+
+static void countDeauth(const uint8_t *frame, size_t len) {
+  if (len < 24) return;
+  uint8_t subtype = frame[0] >> 4;
+  if (subtype != 10 && subtype != 12) return;
+  deauthFrames++;
+  memcpy(deauthTarget, frame + 4, 6);
+  memcpy(deauthSource, frame + 10, 6);
+}
+
 static void onPacket(void *buffer, wifi_promiscuous_pkt_type_t kind) {
   auto *packet = (wifi_promiscuous_pkt_t *)buffer;
   uint8_t channel = packet->rx_ctrl.channel;
@@ -185,6 +234,12 @@ static void onPacket(void *buffer, wifi_promiscuous_pkt_type_t kind) {
   len -= 4;
   if (len < 24) return;
   uint8_t subtype = frame[0] >> 4;
+  if (kind == WIFI_PKT_MGMT && (subtype == 10 || subtype == 12)) {
+    portENTER_CRITICAL(&deviceMux);
+    countDeauth(frame, len);
+    portEXIT_CRITICAL(&deviceMux);
+    return;
+  }
   if (kind == WIFI_PKT_DATA && !(frame[1] & 0x40)) {
     size_t header = 24 + ((frame[1] & 3) == 3 ? 6 : 0);
     if (subtype & 8) header += 2;
@@ -209,7 +264,7 @@ static void onPacket(void *buffer, wifi_promiscuous_pkt_type_t kind) {
       portEXIT_CRITICAL(&capMux);
     }
   }
-  if (kind == WIFI_PKT_MGMT && subtype == 8) {
+  if (kind == WIFI_PKT_MGMT && (subtype == 8 || subtype == 5)) {
     if (len < 36) return;
     char name[33] = {};
     if (!parseSsid(frame + 36, len - 36, name)) return;
@@ -225,6 +280,8 @@ static void onPacket(void *buffer, wifi_promiscuous_pkt_type_t kind) {
     }
     const uint8_t *ap = frame + 16;
     portENTER_CRITICAL(&deviceMux);
+    trackAdvertiser(ap, name);
+    if (subtype == 5) { portEXIT_CRITICAL(&deviceMux); return; }
     size_t slot = 0;
     while (slot < beaconCount && memcmp(beacons[slot].bssid, ap, 6)) slot++;
     if (slot == beaconCount) {
@@ -647,6 +704,97 @@ static void sendPacketMonitor() {
   ws.textAll(out);
 }
 
+static uint64_t hashPart(uint64_t hash, const void *bytes, size_t len) {
+  const uint8_t *p = (const uint8_t *)bytes;
+  for (size_t i = 0; i < len; i++) { hash ^= p[i]; hash *= 1099511628211ULL; }
+  return hash;
+}
+
+static void sendAlert(const char *kind, const String &detail, uint64_t key) {
+  uint32_t now = millis();
+  size_t slot = 0;
+  while (slot < alertStampCount && alertStamps[slot].key != key) slot++;
+  if (slot < alertStampCount && (uint32_t)(now - alertStamps[slot].sent) < 30000) return;
+  if (slot == alertStampCount) {
+    if (alertStampCount < 64) alertStampCount++;
+    else {
+      slot = 0;
+      for (size_t i = 1; i < alertStampCount; i++)
+        if ((uint32_t)(now - alertStamps[i].sent) > (uint32_t)(now - alertStamps[slot].sent)) slot = i;
+    }
+  }
+  alertStamps[slot] = {key, now};
+  JsonDocument doc;
+  doc["type"] = "alert";
+  doc["kind"] = kind;
+  doc["detail"] = detail;
+  doc["ts"] = now / 1000;
+  String out;
+  serializeJson(doc, out);
+  ws.textAll(out);
+  Serial.println(out);
+}
+
+static void checkDetections() {
+  struct AdSummary { uint8_t bssid[6], count; uint32_t seen; } ads[32];
+  Beacon aps[48];
+  size_t adCount, apCount;
+  uint32_t flood;
+  uint8_t source[6], target[6];
+  portENTER_CRITICAL(&deviceMux);
+  adCount = advertiserCount;
+  for (size_t i = 0; i < adCount; i++) {
+    memcpy(ads[i].bssid, advertisers[i].bssid, 6);
+    ads[i].count = advertisers[i].count;
+    ads[i].seen = advertisers[i].seen;
+  }
+  apCount = beaconCount;
+  memcpy(aps, beacons, apCount * sizeof(Beacon));
+  flood = deauthFrames;
+  deauthFrames = 0;
+  memcpy(source, deauthSource, 6);
+  memcpy(target, deauthTarget, 6);
+  portEXIT_CRITICAL(&deviceMux);
+  uint32_t now = millis();
+  for (size_t i = 0; i < adCount; i++) if (ads[i].count >= karmaThreshold && (uint32_t)(now - ads[i].seen) <= 30000) {
+    uint64_t key = hashPart(1, ads[i].bssid, 6);
+    key = hashPart(key, &ads[i].count, 1);
+    sendAlert("karma", macText(ads[i].bssid) + " advertised " + String(ads[i].count) +
+              " distinct SSIDs (passive indicator)", key);
+  }
+  for (size_t i = 0; i < apCount; i++) {
+    if (!aps[i].ssid[0] || (uint32_t)(now - aps[i].seen) > 30000) continue;
+    for (size_t j = i + 1; j < apCount; j++) {
+      if (strcmp(aps[i].ssid, aps[j].ssid) || (uint32_t)(now - aps[j].seen) > 30000) continue;
+      const uint8_t *first = aps[i].bssid, *second = aps[j].bssid;
+      if (memcmp(first, second, 6) > 0) { first = aps[j].bssid; second = aps[i].bssid; }
+      uint64_t key = hashPart(2, aps[i].ssid, strlen(aps[i].ssid));
+      key = hashPart(key, first, 6);
+      key = hashPart(key, second, 6);
+      sendAlert("evil_twin", String("SSID '") + aps[i].ssid + "': " + macText(aps[i].bssid) +
+                " ch " + String(aps[i].channel) + " " + String(aps[i].rssi) + " dBm; " +
+                macText(aps[j].bssid) + " ch " + String(aps[j].channel) + " " +
+                String(aps[j].rssi) + " dBm. May be normal multi-AP/mesh roaming; indicator, not proof.", key);
+    }
+  }
+  if (flood > 20) {
+    uint64_t key = hashPart(3, source, 6);
+    key = hashPart(key, target, 6);
+    sendAlert("deauth", String(flood) + " deauth/disassoc frames in ~1 s, source " +
+              macText(source) + ", target " + macText(target), key);
+  }
+}
+
+static void sendDetectState(AsyncWebSocketClient *client = nullptr) {
+  JsonDocument doc;
+  doc["type"] = "detect";
+  doc["thresh"] = karmaThreshold;
+  String out;
+  serializeJson(doc, out);
+  if (client) client->text(out);
+  else ws.textAll(out);
+}
+
 static const char *encName(wifi_auth_mode_t m) {
   switch (m) {
     case WIFI_AUTH_OPEN: return "OPEN";
@@ -688,6 +836,7 @@ static void onWsEvent(AsyncWebSocket *, AsyncWebSocketClient *client,
     sendCapState(client);
     sendAuthState(client);
     sendPortalState(client);
+    sendDetectState(client);
   } else if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo *)arg;
     if (info->final && info->index == 0 && info->len == len &&
@@ -706,6 +855,11 @@ static void onWsEvent(AsyncWebSocket *, AsyncWebSocketClient *client,
       else if (command == "portal:start") portalRequested = 1;
       else if (command == "portal:stop") portalRequested = 0;
       else if (command == "events:list") eventsListRequested = true;
+      else if (command.startsWith("detect:thresh:")) {
+        String number = command.substring(14);
+        int threshold = number.toInt();
+        if (threshold >= 1 && threshold <= 16 && number == String(threshold)) thresholdRequested = threshold;
+      }
       else if (command.startsWith("chan:")) {
         String number = command.substring(5);
         int ch = number.toInt();
@@ -761,6 +915,25 @@ void setup() {
     Serial.println("demo input self-check failed");
     abort();
   }
+
+  uint8_t response[40] = {};
+  response[0] = 0x50;
+  response[36] = 0; response[37] = 2; response[38] = 'A'; response[39] = 'B';
+  char responseSsid[33] = {};
+  uint8_t testBssid[6] = {2, 0, 0, 0, 0, 1};
+  uint8_t deauth[24] = {};
+  deauth[0] = 0xc0;
+  countDeauth(deauth, sizeof(deauth));
+  if (!parseSsid(response + 36, sizeof(response) - 36, responseSsid) ||
+      strcmp(responseSsid, "AB") || parseSsid(response + 36, 3, responseSsid) ||
+      trackAdvertiser(testBssid, "AB") != 1 || trackAdvertiser(testBssid, "AB") != 1 ||
+      trackAdvertiser(testBssid, "CD") != 2 ||
+      deauthFrames != 1) {
+    Serial.println("detection self-check failed");
+    abort();
+  }
+  advertiserCount = 0;
+  deauthFrames = 0;
 
   fsReady = LittleFS.begin(false);
   if (!fsReady) {
@@ -822,6 +995,12 @@ unsigned long lastBeat = 0;
 
 void loop() {
   ws.cleanupClients();
+
+  if (thresholdRequested) {
+    karmaThreshold = thresholdRequested;
+    thresholdRequested = 0;
+    sendDetectState();
+  }
 
   if (authRequested != -1) {
     int requested = authRequested;
@@ -910,17 +1089,24 @@ void loop() {
     else if (!sniffing) {
       wifi_promiscuous_filter_t filter = {};
       filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_CTRL;
-      esp_err_t err = esp_wifi_set_channel(sniffChannel, WIFI_SECOND_CHAN_NONE);
-      if (err == ESP_OK) err = esp_wifi_set_promiscuous_filter(&filter);
-      if (err == ESP_OK) err = esp_wifi_set_promiscuous_rx_cb(onPacket);
+      const char *stage = "channel";
+      uint8_t currentChannel = 0;
+      wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
+      esp_err_t err = esp_wifi_get_channel(&currentChannel, &secondary);
+      if (err == ESP_OK && currentChannel != sniffChannel)
+        err = esp_wifi_set_channel(sniffChannel, WIFI_SECOND_CHAN_NONE);
+      if (err == ESP_OK) { stage = "filter"; err = esp_wifi_set_promiscuous_filter(&filter); }
+      if (err == ESP_OK) { stage = "callback"; err = esp_wifi_set_promiscuous_rx_cb(onPacket); }
       if (err == ESP_OK) {
         portENTER_CRITICAL(&deviceMux);
         memset(packetCounts, 0, sizeof(packetCounts));
+        advertiserCount = 0;
+        deauthFrames = 0;
         portEXIT_CRITICAL(&deviceMux);
       }
-      if (err == ESP_OK) err = esp_wifi_set_promiscuous(true);
+      if (err == ESP_OK) { stage = "enable"; err = esp_wifi_set_promiscuous(true); }
       if (err == ESP_OK) { sniffing = true; lastStaUpdate = millis(); wsLog("sniffer started on channel " + String(sniffChannel)); sendSniffState(); }
-      else { wsLog("sniffer start failed: " + String(esp_err_to_name(err))); sendSniffState(); }
+      else { wsLog("sniffer start failed at " + String(stage) + ": " + String(esp_err_to_name(err))); sendSniffState(); }
     }
   }
   if (capStartRequested) {
@@ -940,6 +1126,7 @@ void loop() {
     sendDevices();
     sendBeacons();
     sendPacketMonitor();
+    checkDetections();
     if (capturing) sendCapState();
   }
   if (capturing && !flushCapture()) stopCapture("capture stopped: storage full or write failed", false);
