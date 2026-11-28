@@ -1,0 +1,14 @@
+# Lab demo
+
+Use only your own access point and test devices. The board has no local controls; use its web dashboard and serial log.
+
+1. Build with `pio run`. Flash firmware with `pio run -t upload`, then flash the dashboard with the separate command `pio run -t uploadfs`. Open `pio device monitor` at 115200 baud and confirm the SoftAP address and web server message. A filesystem upload replaces saved runtime files, so download captures first.
+2. Join Wi-Fi **AetherDeck** with password **aetherdeck**. Open `http://192.168.4.1`. At the browser password prompt, enter username **admin** and password **aetherdeck**. Change both passwords in **Settings** before using the board beyond a closed lab.
+3. In **Wi-Fi networks**, press **Scan**. Wait for the SSID, BSSID, signal, channel, and security columns to fill. The dashboard may reconnect while the radio scans.
+4. In **Wi-Fi sniffer**, choose the AP channel and press **Sniff start**. Watch the station and access-point tables and the **Packet monitor**. Channel changes and hopping cannot run while a dashboard client is associated with the SoftAP; monitoring on its current channel still works.
+5. In **Capture**, press **Capture start** while sniffing on the target channel. Connect a test client you control to your own test AP, then press **Capture stop**. Download the saved PCAP from the card and inspect it with a packet viewer. Captures contain real frame data; handle them as lab data.
+6. Turn **Authorized mode** on, then press **Portal start** in **Captive portal (redacted demo)**. Open a second test client's browser on the board's AP. The operator dashboard moves to `/admin`; sign in there with the dashboard password. Submit dummy text on the demo page and confirm that only field lengths and a mask appear in the event table. Press **Portal stop**, then turn Authorized mode off.
+7. Press **Sniff start** again. In **Detect**, leave the threshold at three or select another value. With a separate test source you control, advertise multiple names from one BSSID, duplicate an SSID across BSSIDs, or generate a short deauthentication burst. Match the alert kind and detail to the source. Read [DETECTION.md](DETECTION.md) before interpreting an alert; these signals have false positives.
+8. Stop the Wi-Fi sniffer, then press **Scan start** in **Bluetooth**. Nearby advertising devices appear by address, name, signal, and advertised services. Press **Scan stop** when finished. This is passive scanning only.
+
+In **Settings**, changing the AP name, either password, default channel, detection threshold, or Authorized-mode boot default saves `/config.json` on the board and restarts it. Rejoin the new AP name if it changes. Leave a password field blank to keep its current value. The Authorized-mode toggle changes only the current session; its boot default is a separate setting.

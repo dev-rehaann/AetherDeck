@@ -35,6 +35,9 @@
   #alerts .karma { color:#f0b44f; }
   #alerts .evil_twin { color:#f0b44f; }
   #alerts .deauth { color:#f07878; }
+  .settings { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
+  .settings label { display:flex; flex-direction:column; gap:4px; }
+  .settings input,.settings select { width:100%; padding:7px; background:#0b0f14; color:#cdd6e4; border:1px solid #364557; border-radius:6px; }
 </style>
 </head>
 <body>
@@ -49,7 +52,19 @@
       <span class="label">Authorized mode — lab use only</span>
       <button id="auth" disabled>Authorize</button>
     </div>
-    <div class="muted">Required for the captive portal demo. Resets when the board restarts.</div>
+    <div class="muted">Required for the captive portal demo. The boot default is set in Settings.</div>
+  </div>
+  <div class="card">
+    <div class="row"><span class="label">Settings</span><button id="save-settings" type="submit" form="settings" disabled>Save and restart</button></div>
+    <form id="settings" class="settings">
+      <label>AP SSID<input id="cfg-ssid" maxlength="32" required></label>
+      <label>AP password<input id="cfg-ap-pass" type="password" minlength="8" maxlength="63" placeholder="Leave blank to keep" autocomplete="new-password"></label>
+      <label>Dashboard password<input id="cfg-dashboard-pass" type="password" minlength="8" maxlength="63" placeholder="Leave blank to keep" autocomplete="new-password"></label>
+      <label>Default channel<select id="cfg-channel"></select></label>
+      <label>Detection threshold<select id="cfg-threshold"></select></label>
+      <label><span>Authorized at boot</span><input id="cfg-auth-default" type="checkbox"></label>
+    </form>
+    <div class="muted">Passwords are never displayed here. Saving restarts the board; rejoin the AP if its name or password changes.</div>
   </div>
   <div class="card">
     <div class="row">
@@ -87,6 +102,13 @@
   <div class="card">
     <div class="label">Packet monitor — channel <span id="monitor-channel">1</span></div>
     <div class="stats" id="packet-stats"></div>
+  </div>
+  <div class="card">
+    <div class="row"><span class="label">Bluetooth — passive scan</span><button id="ble-scan" disabled>Scan start</button></div>
+    <table>
+      <thead><tr><th>MAC</th><th>Name</th><th>RSSI</th><th>Advertised services</th></tr></thead>
+      <tbody id="ble-devices"><tr><td colspan="4" class="muted">scan stopped</td></tr></tbody>
+    </table>
   </div>
   <div class="card">
     <div class="row">
@@ -149,8 +171,20 @@
   const portalBtn = document.getElementById('portal');
   const eventCount = document.getElementById('event-count');
   const events = document.getElementById('events');
+  const bleBtn = document.getElementById('ble-scan');
+  const bleDevices = document.getElementById('ble-devices');
+  const settingsForm = document.getElementById('settings');
+  const saveSettings = document.getElementById('save-settings');
+  const cfgSsid = document.getElementById('cfg-ssid');
+  const cfgApPass = document.getElementById('cfg-ap-pass');
+  const cfgDashboardPass = document.getElementById('cfg-dashboard-pass');
+  const cfgChannel = document.getElementById('cfg-channel');
+  const cfgThreshold = document.getElementById('cfg-threshold');
+  const cfgAuthDefault = document.getElementById('cfg-auth-default');
   for (let ch = 1; ch <= 13; ch++) channel.add(new Option(ch, ch));
+  for (let ch = 1; ch <= 13; ch++) cfgChannel.add(new Option(ch, ch));
   for (let n = 1; n <= 16; n++) detectThreshold.add(new Option(n, n));
+  for (let n = 1; n <= 16; n++) cfgThreshold.add(new Option(n, n));
   let sock = null;
   let sniffing = false;
   let hopping = false;
@@ -158,6 +192,7 @@
   let authorized = false;
   let portalOn = false;
   let lastEventCount = -1;
+  let bleScanning = false;
 
   function add(line, cls){
     const d = document.createElement('div');
@@ -261,6 +296,21 @@
       events.appendChild(tr);
     }
   }
+  function renderBle(list){
+    bleDevices.replaceChildren();
+    const unique = [...new Map(list.map(d => [d.mac, d])).values()].sort((a,b) => b.rssi - a.rssi);
+    if (!unique.length){ bleDevices.innerHTML = '<tr><td colspan="4" class="muted">no devices seen</td></tr>'; return; }
+    for (const d of unique){
+      const tr = document.createElement('tr');
+      for (const [value,cls] of [[d.mac,'mono'],[d.name || '<unnamed>','ssid'],[d.rssi + ' dBm','rssi'],[d.services.join(', ') || '—','ssid']]){
+        const td = document.createElement('td');
+        if (cls) td.className = cls;
+        td.textContent = value;
+        tr.appendChild(td);
+      }
+      bleDevices.appendChild(tr);
+    }
+  }
   scanBtn.onclick = () => { if (sock && sock.readyState === 1){ sock.send('scan'); scanBtn.disabled = true; } };
   sniffBtn.onclick = () => { sock.send(sniffing ? 'sniff:stop' : 'sniff:start'); sniffBtn.disabled = true; };
   hopBtn.onclick = () => { sock.send(hopping ? 'hop:off' : 'hop:on'); hopBtn.disabled = true; };
@@ -269,46 +319,75 @@
   authBtn.onclick = () => { sock.send(authorized ? 'auth:off' : 'auth:on'); authBtn.disabled = true; };
   portalBtn.onclick = () => { sock.send(portalOn ? 'portal:stop' : 'portal:start'); portalBtn.disabled = true; };
   detectThreshold.onchange = () => { if (sock && sock.readyState === 1) sock.send('detect:thresh:' + detectThreshold.value); };
+  bleBtn.onclick = () => { sock.send(bleScanning ? 'ble:scan:stop' : 'ble:scan:start'); bleBtn.disabled = true; };
+  settingsForm.onsubmit = e => {
+    e.preventDefault();
+    if (!sock || sock.readyState !== 1) return;
+    sock.send('cfg:set:' + JSON.stringify({ssid:cfgSsid.value, ap_pass:cfgApPass.value, dashboard_pass:cfgDashboardPass.value,
+      channel:Number(cfgChannel.value), threshold:Number(cfgThreshold.value), auth_default:cfgAuthDefault.checked}));
+    saveSettings.disabled = true;
+  };
 
   function connect(){
     sock = new WebSocket('ws://' + location.host + '/ws');
-    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = portalOn || sniffing; sniffBtn.disabled = false; hopBtn.disabled = portalOn || !sniffing || capturing; channel.disabled = portalOn || capturing; capBtn.disabled = portalOn; authBtn.disabled = false; detectThreshold.disabled = false; sock.send('caps:list'); sock.send('events:list'); add('[ws] connected','muted'); };
+    sock.onopen = () => { dot.classList.add('on'); statusEl.textContent = 'connected'; scanBtn.disabled = portalOn || sniffing || bleScanning; sniffBtn.disabled = bleScanning; hopBtn.disabled = portalOn || !sniffing || capturing || bleScanning; channel.disabled = portalOn || capturing || bleScanning; capBtn.disabled = portalOn || bleScanning; bleBtn.disabled = portalOn; authBtn.disabled = false; detectThreshold.disabled = false; saveSettings.disabled = false; sock.send('caps:list'); sock.send('events:list'); add('[ws] connected','muted'); };
     sock.onmessage = e => {
       let obj = null;
       try { obj = JSON.parse(e.data); } catch(_) {}
-      if (obj && obj.type === 'scan'){ renderScan(obj.nets); scanBtn.disabled = portalOn || sniffing; sniffBtn.disabled = false; }
+      if (obj && obj.type === 'scan'){ renderScan(obj.nets); scanBtn.disabled = portalOn || sniffing || bleScanning; sniffBtn.disabled = bleScanning; }
       else if (obj && obj.type === 'sta') renderDevices(obj.devices);
       else if (obj && obj.type === 'beacons') renderBeacons(obj.aps);
       else if (obj && obj.type === 'pktmon') renderPackets(obj);
-      else if (obj && obj.type === 'detect') detectThreshold.value = obj.thresh;
+      else if (obj && obj.type === 'detect') { detectThreshold.value = obj.thresh; cfgThreshold.value = obj.thresh; }
       else if (obj && obj.type === 'alert') renderAlert(obj);
+      else if (obj && obj.type === 'cfg') {
+        cfgSsid.value = obj.ssid;
+        cfgChannel.value = obj.channel;
+        cfgThreshold.value = obj.threshold;
+        cfgAuthDefault.checked = obj.auth_default;
+        saveSettings.disabled = false;
+      }
+      else if (obj && obj.type === 'ble') renderBle(obj.devices);
+      else if (obj && obj.type === 'ble_state'){
+        bleScanning = obj.on;
+        bleBtn.textContent = bleScanning ? 'Scan stop' : 'Scan start';
+        bleBtn.disabled = portalOn;
+        scanBtn.disabled = portalOn || sniffing || bleScanning;
+        sniffBtn.disabled = bleScanning;
+        hopBtn.disabled = portalOn || !sniffing || capturing || bleScanning;
+        channel.disabled = portalOn || capturing || bleScanning;
+        capBtn.disabled = portalOn || bleScanning;
+        portalBtn.disabled = (!authorized && !portalOn) || bleScanning;
+        if (!bleScanning) bleDevices.innerHTML = '<tr><td colspan="4" class="muted">scan stopped</td></tr>';
+      }
       else if (obj && obj.type === 'caps') renderCaps(obj.files);
       else if (obj && obj.type === 'events') renderEvents(obj.entries);
       else if (obj && obj.type === 'auth'){
         authorized = obj.on;
         authBtn.textContent = authorized ? 'Authorized mode off' : 'Authorize';
         authBtn.disabled = false;
-        portalBtn.disabled = !authorized && !portalOn;
+        portalBtn.disabled = (!authorized && !portalOn) || bleScanning;
       }
       else if (obj && obj.type === 'portal'){
         portalOn = obj.on;
         eventCount.textContent = obj.events;
         portalBtn.textContent = portalOn ? 'Portal stop' : 'Portal start';
-        portalBtn.disabled = !authorized && !portalOn;
-        scanBtn.disabled = portalOn || sniffing;
-        hopBtn.disabled = portalOn || !sniffing || capturing;
-        channel.disabled = portalOn || capturing;
-        capBtn.disabled = portalOn;
+        portalBtn.disabled = (!authorized && !portalOn) || bleScanning;
+        scanBtn.disabled = portalOn || sniffing || bleScanning;
+        hopBtn.disabled = portalOn || !sniffing || capturing || bleScanning;
+        channel.disabled = portalOn || capturing || bleScanning;
+        capBtn.disabled = portalOn || bleScanning;
+        bleBtn.disabled = portalOn;
         if (obj.events !== lastEventCount){ lastEventCount = obj.events; sock.send('events:list'); }
       }
       else if (obj && obj.type === 'cap'){
         capturing = obj.on;
         capBtn.textContent = capturing ? 'Capture stop' : 'Capture start';
-        capBtn.disabled = portalOn;
+        capBtn.disabled = portalOn || bleScanning;
         capFile.textContent = obj.file || 'none';
         for (const key of ['eapol','pmkid','dropped']) document.getElementById(key).textContent = obj[key];
-        hopBtn.disabled = portalOn || !sniffing || capturing;
-        channel.disabled = portalOn || capturing;
+        hopBtn.disabled = portalOn || !sniffing || capturing || bleScanning;
+        channel.disabled = portalOn || capturing || bleScanning;
       }
       else if (obj && obj.type === 'sniff'){
         sniffing = obj.on;
@@ -317,14 +396,18 @@
         currentChannel.textContent = obj.ch;
         sniffBtn.textContent = sniffing ? 'Sniff stop' : 'Sniff start';
         hopBtn.textContent = hopping ? 'Hop off' : 'Hop on';
-        hopBtn.disabled = portalOn || !sniffing || capturing;
-        sniffBtn.disabled = false;
-        scanBtn.disabled = portalOn || sniffing;
+        hopBtn.disabled = portalOn || !sniffing || capturing || bleScanning;
+        sniffBtn.disabled = bleScanning;
+        scanBtn.disabled = portalOn || sniffing || bleScanning;
         if (!sniffing) devices.innerHTML = '<tr><td colspan="4" class="muted">sniffer stopped</td></tr>';
       }
-      else add(e.data);
+      else {
+        add(e.data);
+        if (e.data.startsWith('settings refused')) saveSettings.disabled = false;
+        if (e.data === 'settings saved; board restarting'){ cfgApPass.value = ''; cfgDashboardPass.value = ''; }
+      }
     };
-    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; sniffBtn.disabled = true; hopBtn.disabled = true; channel.disabled = true; capBtn.disabled = true; authBtn.disabled = true; portalBtn.disabled = true; detectThreshold.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
+    sock.onclose = () => { dot.classList.remove('on'); statusEl.textContent = 'disconnected — retrying'; scanBtn.disabled = true; sniffBtn.disabled = true; hopBtn.disabled = true; channel.disabled = true; capBtn.disabled = true; authBtn.disabled = true; portalBtn.disabled = true; bleBtn.disabled = true; saveSettings.disabled = true; detectThreshold.disabled = true; add('[ws] disconnected','muted'); setTimeout(connect, 1500); };
     sock.onerror = () => sock.close();
   }
   connect();

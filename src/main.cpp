@@ -6,11 +6,19 @@
 #include <esp_wifi.h>
 #include <esp_timer.h>
 #include <DNSServer.h>
+#include <NimBLEDevice.h>
 
-// Default AP credentials — meant to be known so you can connect (WPA2, >=8
-// chars). Made configurable in Settings (Step 8).
-static const char *AP_SSID = "AetherDeck";
-static const char *AP_PASS = "aetherdeck";
+struct Config {
+  String ssid, apPass, dashboardPass;
+  uint8_t channel, threshold;
+  bool authDefault;
+};
+static Config config = {"AetherDeck", "aetherdeck", "aetherdeck", 1, 3, false};
+static Config defaults() { return {"AetherDeck", "aetherdeck", "aetherdeck", 1, 3, false}; }
+static char configRequest[512] = {};
+static bool configRequested = false;
+static portMUX_TYPE configMux = portMUX_INITIALIZER_UNLOCKED;
+static unsigned long restartAt = 0;
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -114,6 +122,53 @@ static CaptureFrame capRing[CAP_RING_SIZE];
 static CaptureFrame capPending;
 static size_t capHead = 0, capTail = 0, capCount = 0;
 static portMUX_TYPE capMux = portMUX_INITIALIZER_UNLOCKED;
+
+struct BleDevice {
+  char mac[18], name[33], services[3][37];
+  uint8_t serviceCount;
+  int8_t rssi;
+  uint32_t seen;
+};
+// shortcut: 32 devices and three advertised services each bound RAM; raise caps for denser lab scans.
+static BleDevice bleDevices[32];
+static size_t bleCount = 0;
+static portMUX_TYPE bleMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool bleStartRequested = false, bleStopRequested = false;
+static volatile bool bleScanning = false;
+static bool bleResumeSniff = false, bleInitialized = false;
+static NimBLEScan *bleScan = nullptr;
+static unsigned long lastBleUpdate = 0;
+
+class BleCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice *device) override {
+    if (!bleScanning) return;
+    BleDevice next = {};
+    snprintf(next.mac, sizeof(next.mac), "%s", device->getAddress().toString().c_str());
+    snprintf(next.name, sizeof(next.name), "%s", device->getName().c_str());
+    next.rssi = device->getRSSI();
+    next.seen = millis();
+    next.serviceCount = min((int)device->getServiceUUIDCount(), 3);
+    for (uint8_t i = 0; i < next.serviceCount; i++)
+      snprintf(next.services[i], sizeof(next.services[i]), "%s", device->getServiceUUID(i).toString().c_str());
+    bool fresh = false;
+    portENTER_CRITICAL(&bleMux);
+    size_t slot = 0;
+    while (slot < bleCount && strcmp(bleDevices[slot].mac, next.mac)) slot++;
+    if (slot == bleCount) {
+      fresh = true;
+      if (bleCount < 32) bleCount++;
+      else {
+        slot = 0;
+        for (size_t i = 1; i < bleCount; i++)
+          if ((uint32_t)(next.seen - bleDevices[i].seen) > (uint32_t)(next.seen - bleDevices[slot].seen)) slot = i;
+      }
+    }
+    bleDevices[slot] = next;
+    portEXIT_CRITICAL(&bleMux);
+    if (fresh) Serial.printf("BLE device %s, RSSI %d\n", next.mac, next.rssi);
+  }
+};
+static BleCallbacks bleCallbacks;
 
 static void put16(uint8_t *out, uint16_t value) {
   out[0] = value;
@@ -349,6 +404,114 @@ static void onPacket(void *buffer, wifi_promiscuous_pkt_type_t kind) {
 static void wsLog(const String &line) {
   Serial.println(line);
   ws.textAll(line);
+}
+
+static bool validText(const String &value, size_t minLen, size_t maxLen) {
+  if (value.length() < minLen || value.length() > maxLen) return false;
+  for (size_t i = 0; i < value.length(); i++) {
+    unsigned char c = value[i];
+    if (c < 32 || c == 127) return false;
+  }
+  return true;
+}
+
+static bool parseConfig(const String &raw, Config &out, bool keepBlankPasswords = false) {
+  JsonDocument doc;
+  if (deserializeJson(doc, raw) || !doc.is<JsonObject>() ||
+      !doc["ssid"].is<const char *>() || !doc["ap_pass"].is<const char *>() ||
+      !doc["dashboard_pass"].is<const char *>() || !doc["channel"].is<int>() ||
+      !doc["threshold"].is<int>() || !doc["auth_default"].is<bool>()) return false;
+  Config next = {doc["ssid"].as<String>(), doc["ap_pass"].as<String>(),
+                 doc["dashboard_pass"].as<String>(), 0, 0, doc["auth_default"].as<bool>()};
+  int channel = doc["channel"].as<int>(), threshold = doc["threshold"].as<int>();
+  if (keepBlankPasswords && !next.apPass.length()) next.apPass = out.apPass;
+  if (keepBlankPasswords && !next.dashboardPass.length()) next.dashboardPass = out.dashboardPass;
+  if (!validText(next.ssid, 1, 32) || !validText(next.apPass, 8, 63) ||
+      !validText(next.dashboardPass, 8, 63) || channel < 1 || channel > 13 ||
+      threshold < 1 || threshold > 16) return false;
+  next.channel = channel;
+  next.threshold = threshold;
+  out = next;
+  return true;
+}
+
+static bool saveConfig(const Config &value) {
+  if (!fsReady) return false;
+  size_t total = LittleFS.totalBytes(), used = LittleFS.usedBytes();
+  if (used > total || total - used < 1024) return false;
+  JsonDocument doc;
+  doc["ssid"] = value.ssid;
+  doc["ap_pass"] = value.apPass;
+  doc["dashboard_pass"] = value.dashboardPass;
+  doc["channel"] = value.channel;
+  doc["threshold"] = value.threshold;
+  doc["auth_default"] = value.authDefault;
+  File file = LittleFS.open("/config.tmp", "w");
+  if (!file) return false;
+  size_t written = serializeJson(doc, file);
+  file.flush();
+  bool good = written > 0 && !file.getWriteError();
+  file.close();
+  if (!good || !LittleFS.rename("/config.tmp", "/config.json")) {
+    LittleFS.remove("/config.tmp");
+    return false;
+  }
+  return true;
+}
+
+static void sendConfigState(AsyncWebSocketClient *client = nullptr) {
+  JsonDocument doc;
+  doc["type"] = "cfg";
+  doc["ssid"] = config.ssid;
+  doc["channel"] = config.channel;
+  doc["threshold"] = config.threshold;
+  doc["auth_default"] = config.authDefault;
+  String out;
+  serializeJson(doc, out);
+  if (client) client->text(out);
+  else ws.textAll(out);
+}
+
+// Basic authentication over the local AP protects the dashboard, but is not a hardened scheme.
+static bool dashboardAccess(AsyncWebServerRequest *request) {
+  if (request->authenticate("admin", config.dashboardPass.c_str())) return true;
+  request->requestAuthentication(AsyncAuthType::AUTH_BASIC, "AetherDeck");
+  return false;
+}
+
+static void sendBleState(AsyncWebSocketClient *client = nullptr) {
+  JsonDocument doc;
+  doc["type"] = "ble_state";
+  doc["on"] = bleScanning;
+  String out;
+  serializeJson(doc, out);
+  if (client) client->text(out);
+  else ws.textAll(out);
+}
+
+static void sendBleDevices(AsyncWebSocketClient *client = nullptr) {
+  JsonDocument doc;
+  doc["type"] = "ble";
+  JsonArray list = doc["devices"].to<JsonArray>();
+  portENTER_CRITICAL(&bleMux);
+  size_t count = bleCount;
+  portEXIT_CRITICAL(&bleMux);
+  for (size_t i = 0; i < count; i++) {
+    BleDevice entry;
+    portENTER_CRITICAL(&bleMux);
+    entry = bleDevices[i];
+    portEXIT_CRITICAL(&bleMux);
+    JsonObject item = list.add<JsonObject>();
+    item["mac"] = entry.mac;
+    item["name"] = entry.name;
+    item["rssi"] = entry.rssi;
+    JsonArray services = item["services"].to<JsonArray>();
+    for (uint8_t j = 0; j < entry.serviceCount; j++) services.add(entry.services[j]);
+  }
+  String out;
+  serializeJson(doc, out);
+  if (client) client->text(out);
+  else ws.textAll(out);
 }
 
 static void sendAuthState(AsyncWebSocketClient *client = nullptr) {
@@ -600,6 +763,7 @@ static void stopPortal() {
 
 static void startPortal() {
   if (!authorized) { wsLog("demo portal refused: Authorized mode is off"); sendPortalState(); return; }
+  if (bleScanning) { wsLog("demo portal refused: stop BLE scan first"); sendPortalState(); return; }
   if (!fsReady || !LittleFS.exists("/portal/index.html")) {
     wsLog("demo portal refused: page unavailable"); sendPortalState(); return;
   }
@@ -837,9 +1001,12 @@ static void onWsEvent(AsyncWebSocket *, AsyncWebSocketClient *client,
     sendAuthState(client);
     sendPortalState(client);
     sendDetectState(client);
+    sendConfigState(client);
+    sendBleState(client);
+    sendBleDevices(client);
   } else if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo *)arg;
-    if (info->final && info->index == 0 && info->len == len &&
+    if (info->final && info->index == 0 && info->len == len && len <= 512 &&
         info->opcode == WS_TEXT) {
       String command((char *)data, len);
       if (command == "scan") scanRequested = true;
@@ -855,6 +1022,15 @@ static void onWsEvent(AsyncWebSocket *, AsyncWebSocketClient *client,
       else if (command == "portal:start") portalRequested = 1;
       else if (command == "portal:stop") portalRequested = 0;
       else if (command == "events:list") eventsListRequested = true;
+      else if (command == "ble:scan:start") bleStartRequested = true;
+      else if (command == "ble:scan:stop") bleStopRequested = true;
+      else if (command.startsWith("cfg:set:")) {
+        String body = command.substring(8);
+        portENTER_CRITICAL(&configMux);
+        body.toCharArray(configRequest, sizeof(configRequest));
+        configRequested = true;
+        portEXIT_CRITICAL(&configMux);
+      }
       else if (command.startsWith("detect:thresh:")) {
         String number = command.substring(14);
         int threshold = number.toInt();
@@ -935,26 +1111,50 @@ void setup() {
   advertiserCount = 0;
   deauthFrames = 0;
 
+  Config trial = defaults();
+  const String validPrefix = "{\"ssid\":\"Lab\",\"ap_pass\":\"aetherdeck\",\"dashboard_pass\":\"aetherdeck\",\"channel\":";
+  if (parseConfig("", trial) || parseConfig("{broken", trial) ||
+      parseConfig("{\"ssid\":\"Lab\",\"ap_pass\":\"1234567\",\"dashboard_pass\":\"aetherdeck\",\"channel\":1,\"threshold\":3,\"auth_default\":false}", trial) ||
+      parseConfig(validPrefix + "14,\"threshold\":3,\"auth_default\":false}", trial) ||
+      trial.ssid != "AetherDeck" || trial.channel != 1) {
+    Serial.println("config self-check failed");
+    abort();
+  }
+
   fsReady = LittleFS.begin(false);
   if (!fsReady) {
     Serial.println("LittleFS mount failed — dashboard assets won't serve");
   } else {
+    File saved = LittleFS.open("/config.json", "r");
+    if (saved && saved.size() <= 512 && parseConfig(saved.readString(), config))
+      Serial.println("config loaded");
+    else Serial.println("config defaults (missing or invalid file)");
+    saved.close();
     File log = LittleFS.open("/portal_log.txt", "r");
     while (log && log.available() && eventCount < 64) if (log.read() == '\n') eventCount = eventCount + 1;
     eventReserved = eventCount;
   }
 
+  sniffChannel = config.channel;
+  karmaThreshold = config.threshold;
+  authorized = config.authDefault;
+
   WiFi.mode(WIFI_AP_STA);  // AP serves the dashboard; STA lets us scan
-  bool ok = WiFi.softAP(AP_SSID, AP_PASS);
-  Serial.printf("SoftAP \"%s\" -> %s\n", AP_SSID,
+  bool ok = WiFi.softAP(config.ssid.c_str(), config.apPass.c_str(), config.channel);
+  Serial.printf("SoftAP \"%s\" -> %s\n", config.ssid.c_str(),
                 ok ? WiFi.softAPIP().toString().c_str() : "FAILED");
 
   ws.onEvent(onWsEvent);
+  ws.handleHandshake([](AsyncWebServerRequest *request) {
+    return request->authenticate("admin", config.dashboardPass.c_str());
+  });
   server.addHandler(&ws);
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) {
+    if (!portalOn && !dashboardAccess(r)) return;
     r->send(LittleFS, portalOn ? "/portal/index.html" : "/index.html", "text/html");
   });
   server.on("/admin", HTTP_GET, [](AsyncWebServerRequest *r) {
+    if (!dashboardAccess(r)) return;
     r->send(LittleFS, "/index.html", "text/html");
   });
   for (const char *url : {"/generate_204", "/gen_204", "/hotspot-detect.html", "/connecttest.txt", "/ncsi.txt"}) {
@@ -972,6 +1172,7 @@ void setup() {
   });
   server.on("/portal_log.txt", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(404, "text/plain", "not found"); });
   server.on(AsyncURIMatcher::dir("/caps"), HTTP_GET, [](AsyncWebServerRequest *r) {
+    if (!dashboardAccess(r)) return;
     String name = r->url().substring(6);
     String path = "/caps/" + name;
     if (!validCapName(name) || !LittleFS.exists(path) || (capturing && name == capName)) {
@@ -980,7 +1181,6 @@ void setup() {
     }
     r->send(LittleFS, path, "application/vnd.tcpdump.pcap", true);
   });
-  server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
   server.onNotFound([](AsyncWebServerRequest *r) {
     String path = r->url();
     if (portalOn && !path.startsWith("/admin") && !path.startsWith("/ws") &&
@@ -989,6 +1189,7 @@ void setup() {
   });
   server.begin();
   Serial.println("web server up -> http://192.168.4.1");
+  Serial.println("dashboard requires a password");
 }
 
 unsigned long lastBeat = 0;
@@ -996,10 +1197,82 @@ unsigned long lastBeat = 0;
 void loop() {
   ws.cleanupClients();
 
+  if (configRequested) {
+    char raw[sizeof(configRequest)];
+    portENTER_CRITICAL(&configMux);
+    memcpy(raw, configRequest, sizeof(raw));
+    configRequested = false;
+    portEXIT_CRITICAL(&configMux);
+    Config next = config;
+    if (!parseConfig(raw, next, true)) wsLog("settings refused: invalid SSID, password, channel, threshold, or default");
+    else if (!saveConfig(next)) wsLog("settings refused: storage write failed");
+    else {
+      if (capturing) stopCapture("capture stopped for settings");
+      if (bleScanning) { bleScanning = false; bleScan->stop(); sendBleState(); }
+      bleResumeSniff = false;
+      if (portalOn) stopPortal();
+      config = next;
+      wsLog("settings saved; board restarting");
+      sendConfigState();
+      restartAt = millis() + 1500;
+    }
+  }
+
   if (thresholdRequested) {
-    karmaThreshold = thresholdRequested;
+    Config next = config;
+    next.threshold = thresholdRequested;
     thresholdRequested = 0;
-    sendDetectState();
+    if (!saveConfig(next)) { wsLog("threshold not saved: storage write failed"); sendDetectState(); }
+    else { config = next; karmaThreshold = next.threshold; sendDetectState(); sendConfigState(); }
+  }
+
+  if (bleStopRequested) {
+    bleStopRequested = false;
+    if (bleScanning) {
+      bleScanning = false;
+      bleScan->stop();
+      wsLog("BLE scan stopped");
+      sendBleState();
+      if (bleResumeSniff) sniffStartRequested = true;
+      bleResumeSniff = false;
+    }
+  }
+  if (bleStartRequested) {
+    bleStartRequested = false;
+    if (bleScanning) sendBleState();
+    else if (portalOn || scanning || scanRequested) wsLog("BLE scan refused: stop portal or Wi-Fi scan first");
+    else {
+      if (!bleInitialized) {
+        bleInitialized = NimBLEDevice::init("");
+        if (bleInitialized) {
+          bleScan = NimBLEDevice::getScan();
+          bleScan->setScanCallbacks(&bleCallbacks, true);
+          bleScan->setActiveScan(false);
+          bleScan->setMaxResults(0);
+        }
+      }
+      if (!bleInitialized) wsLog("BLE scan refused: radio initialization failed");
+      else {
+        bleResumeSniff = sniffing;
+        esp_err_t err = sniffing ? esp_wifi_set_promiscuous(false) : ESP_OK;
+        if (err != ESP_OK) wsLog("BLE scan refused: cannot pause Wi-Fi sniffer");
+        else {
+          if (capturing) stopCapture("capture stopped for BLE scan");
+          if (sniffing) { sniffing = false; hopping = false; sendSniffState(); }
+          portENTER_CRITICAL(&bleMux);
+          bleCount = 0;
+          portEXIT_CRITICAL(&bleMux);
+          bleScanning = true;
+          if (!bleScan->start(0, false, true)) {
+            bleScanning = false;
+            wsLog("BLE scan failed to start");
+            if (bleResumeSniff) sniffStartRequested = true;
+            bleResumeSniff = false;
+          } else { lastBleUpdate = millis(); wsLog("BLE passive scan started"); sendBleDevices(); }
+        }
+      }
+    }
+    sendBleState();
   }
 
   if (authRequested != -1) {
@@ -1033,6 +1306,7 @@ void loop() {
   if (sniffStopRequested) {
     sniffStopRequested = false;
     sniffStartRequested = false;
+    bleResumeSniff = false;
     if (sniffing) {
       if (capturing) stopCapture("capture stopped");
       esp_err_t err = esp_wifi_set_promiscuous(false);
@@ -1046,7 +1320,8 @@ void loop() {
   // not the async WS callback, to avoid blocking the server task.
   if (scanRequested && !scanning) {
     scanRequested = false;
-    if (portalOn) wsLog("scan refused: stop the demo portal first");
+    if (bleScanning) wsLog("scan refused: stop BLE scan first");
+    else if (portalOn) wsLog("scan refused: stop the demo portal first");
     else if (sniffing) wsLog("scan refused: stop the sniffer first");
     else {
       scanning = true;
@@ -1085,7 +1360,8 @@ void loop() {
   if (capStartRequested && !sniffing && !scanning && !scanRequested) sniffStartRequested = true;
   if (sniffStartRequested) {
     sniffStartRequested = false;
-    if (scanning || scanRequested) { wsLog("sniffer refused: scan in progress"); sendSniffState(); }
+    if (bleScanning) { wsLog("sniffer refused: stop BLE scan first"); sendSniffState(); }
+    else if (scanning || scanRequested) { wsLog("sniffer refused: scan in progress"); sendSniffState(); }
     else if (!sniffing) {
       wifi_promiscuous_filter_t filter = {};
       filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_CTRL;
@@ -1129,6 +1405,10 @@ void loop() {
     checkDetections();
     if (capturing) sendCapState();
   }
+  if (bleScanning && millis() - lastBleUpdate >= 1000) {
+    lastBleUpdate = millis();
+    sendBleDevices();
+  }
   if (capturing && !flushCapture()) stopCapture("capture stopped: storage full or write failed", false);
   if (capsListRequested) { capsListRequested = false; sendCaps(); }
   if (scanning) {
@@ -1149,4 +1429,5 @@ void loop() {
     wsLog("uptime " + String(millis() / 1000) +
           "s | stations: " + String(WiFi.softAPgetStationNum()));
   }
+  if (restartAt && (int32_t)(millis() - restartAt) >= 0) ESP.restart();
 }
